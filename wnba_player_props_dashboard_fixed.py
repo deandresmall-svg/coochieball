@@ -1154,15 +1154,9 @@ def combine_odds_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 PRIZEPICKS_EXPORT_SCRIPT = r'''
-(() => {
+(async () => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const norm = (s) => (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-  const rawText = document.body.innerText || "";
-  const selector = [
-    '[data-testid*="projection"]', '[data-testid*="Projection"]',
-    '[data-projection-id]', '[data-projectionid]', '[data-testid*="player"]',
-    '[class*="projection"]', '[class*="Projection"]', '[class*="pick"]',
-    '[class*="card"]', '[role="button"]', 'button', 'article'
-  ].join(', ');
   const marketWords = [
     "Points", "Pts", "Rebounds", "Rebs", "Assists", "Asts",
     "Pts+Rebs+Asts", "Pts + Rebs + Asts", "Pts Rebs Asts",
@@ -1171,6 +1165,13 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
   const marketAlternation = marketWords.map(x => x.replace(/[+]/g, "\\+").replace(/\s+/g, "\\s*")).join("|");
   const lineMarketRegex = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i");
   const marketLineRegex = new RegExp(`(${marketAlternation})\\s*(\\d+(?:\\.\\d+)?)`, "i");
+  const selector = [
+    '[data-testid*="projection"]', '[data-testid*="Projection"]',
+    '[data-projection-id]', '[data-projectionid]', '[data-testid*="player"]',
+    '[class*="projection"]', '[class*="Projection"]', '[class*="pick"]',
+    '[class*="card"]', '[role="button"]', 'button', 'article'
+  ].join(', ');
+
   function marketName(m) {
     const x = (m || "").toLowerCase().replace(/\s+/g, "");
     if (x === "points" || x === "pts") return "Points";
@@ -1179,69 +1180,127 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
     if (x.includes("pts+rebs+asts") || x.includes("points+rebounds+assists") || x.includes("ptsrebsasts") || x === "pra") return "PRA";
     return m;
   }
+
   function isNameLine(s) {
     const x = norm(s);
     if (!x || x.length < 3 || x.length > 45) return false;
     if (/\d/.test(x)) return false;
-    if (/^(WNBA|NBA|More|Less|Goblin|Demon|Discount|Fantasy Score|Projected|Search|Today|Tomorrow|Live)$/i.test(x)) return false;
+    if (/^(WNBA|NBA|More|Less|Goblin|Demon|Discount|Fantasy Score|Projected|Search|Today|Tomorrow|Live|Popular|All|Board|Promo|Lineup)$/i.test(x)) return false;
     if (marketWords.some(w => x.toLowerCase() === w.toLowerCase())) return false;
     return /^[A-Za-z .'’\-]+$/.test(x);
   }
+
   function parseBlock(text) {
     const raw = (text || "").replace(/\r/g, "\n");
     const spaced = raw
       .replace(/\b(More|Less|Goblin|Demon|Discount|Points|Pts|Rebounds|Rebs|Assists|Asts|PRA)\b/g, "\n$1\n")
       .replace(/(\d+(?:\.\d+)?)/g, "\n$1\n");
     const lines = spaced.split("\n").map(norm).filter(Boolean);
-    let best = null;
     for (let i = 0; i < lines.length; i++) {
-      const joined3 = lines.slice(i, Math.min(lines.length, i + 3)).join(" ");
+      const joined4 = lines.slice(i, Math.min(lines.length, i + 4)).join(" ");
       let line = null, market = null;
-      let m = joined3.match(lineMarketRegex);
+      let m = joined4.match(lineMarketRegex);
       if (m) { line = parseFloat(m[1]); market = marketName(m[2]); }
       if (!m) {
-        m = joined3.match(marketLineRegex);
+        m = joined4.match(marketLineRegex);
         if (m) { market = marketName(m[1]); line = parseFloat(m[2]); }
       }
       if (!m || !Number.isFinite(line)) continue;
       let player = "";
-      for (let j = i - 1; j >= Math.max(0, i - 10); j--) {
+      for (let j = i - 1; j >= Math.max(0, i - 12); j--) {
         if (isNameLine(lines[j])) { player = lines[j]; break; }
       }
       if (!player) continue;
-      const windowText = lines.slice(Math.max(0, i - 8), Math.min(lines.length, i + 8)).join(" ").toLowerCase();
+      const windowText = lines.slice(Math.max(0, i - 10), Math.min(lines.length, i + 10)).join(" ").toLowerCase();
       const promo_type = windowText.includes("goblin") ? "goblin" : windowText.includes("demon") ? "demon" : windowText.includes("discount") ? "discount" : "normal";
-      best = { player, market, line, promo_type, raw_text: raw.slice(0, 1200) };
-      break;
+      return { player, market, line, promo_type, raw_text: raw.slice(0, 1200) };
     }
-    return best;
+    return null;
   }
+
   const rows = [];
   const seen = new Set();
-  const elements = [...document.querySelectorAll(selector)].map((el, idx) => {
-    const visible_text = el.innerText || el.textContent || "";
-    const parsed = parseBlock(visible_text);
-    if (parsed) {
-      const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
-      if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
-    }
-    return {
-      idx,
-      tag: el.tagName,
-      visible_text: visible_text.slice(0, 1500),
-      attributes: Object.fromEntries([...el.attributes].slice(0, 30).map(a => [a.name, a.value]))
-    };
-  });
-  if (rows.length === 0) {
-    const blocks = rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g);
-    for (const block of blocks) {
-      const parsed = parseBlock(block);
-      if (!parsed) continue;
-      const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
-      if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
+  const elements = [];
+  const addParsed = (parsed) => {
+    if (!parsed) return;
+    const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
+  };
+
+  function collectVisible(passLabel) {
+    const els = [...document.querySelectorAll(selector)];
+    for (const [idx, el] of els.entries()) {
+      const visible_text = el.innerText || el.textContent || "";
+      const parsed = parseBlock(visible_text);
+      addParsed(parsed);
+      if (elements.length < 400) {
+        elements.push({
+          pass: passLabel,
+          idx,
+          tag: el.tagName,
+          visible_text: visible_text.slice(0, 1500),
+          attributes: Object.fromEntries([...el.attributes].slice(0, 30).map(a => [a.name, a.value]))
+        });
+      }
     }
   }
-  const payload = { exported_at: new Date().toISOString(), page_url: window.location.href, source: "PrizePicks browser export v2", rows, elements, raw_text: rawText };
+
+  function findScrollTarget() {
+    const candidates = [...document.querySelectorAll('main, [role="main"], [class*="scroll"], [class*="Scroll"], [class*="overflow"], div, section')]
+      .filter(el => el && el.scrollHeight > el.clientHeight + 250)
+      .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+    return candidates[0] || document.scrollingElement || document.documentElement;
+  }
+
+  const scrollTarget = findScrollTarget();
+  const scrollInfo = {
+    tag: scrollTarget.tagName || "document",
+    className: scrollTarget.className || "",
+    initialScrollHeight: scrollTarget.scrollHeight,
+    initialClientHeight: scrollTarget.clientHeight
+  };
+
+  collectVisible("initial");
+
+  let lastTop = -1;
+  let stuck = 0;
+  const maxPasses = 90;
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    if (scrollTarget === document.scrollingElement || scrollTarget === document.documentElement || scrollTarget === document.body) {
+      window.scrollBy(0, Math.floor(window.innerHeight * 0.85));
+      await sleep(650);
+      collectVisible(`scroll_${pass}`);
+      const currentTop = window.scrollY;
+      if (Math.abs(currentTop - lastTop) < 5) stuck += 1; else stuck = 0;
+      lastTop = currentTop;
+      const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 20);
+      if (nearBottom || stuck >= 4) break;
+    } else {
+      scrollTarget.scrollTop += Math.floor(scrollTarget.clientHeight * 0.85);
+      await sleep(650);
+      collectVisible(`scroll_${pass}`);
+      const currentTop = scrollTarget.scrollTop;
+      if (Math.abs(currentTop - lastTop) < 5) stuck += 1; else stuck = 0;
+      lastTop = currentTop;
+      const nearBottom = (scrollTarget.scrollTop + scrollTarget.clientHeight) >= (scrollTarget.scrollHeight - 20);
+      if (nearBottom || stuck >= 4) break;
+    }
+  }
+
+  const rawText = document.body.innerText || "";
+  const blocks = rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g);
+  for (const block of blocks) addParsed(parseBlock(block));
+
+  const payload = {
+    exported_at: new Date().toISOString(),
+    page_url: window.location.href,
+    source: "PrizePicks browser export v3 auto-scroll",
+    row_count: rows.length,
+    rows,
+    elements,
+    scroll_info: scrollInfo,
+    raw_text: rawText
+  };
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const link = document.createElement("a");
