@@ -129,15 +129,48 @@ TEAM_NAMES = {
 
 BOOKMAKER_LABELS = {
     "hardrockbet": "Hard Rock Bet",
+    "hard_rock_bet": "Hard Rock Bet",
     "fanduel": "FanDuel",
+    "fan_duel": "FanDuel",
     "draftkings": "DraftKings",
+    "draft_kings": "DraftKings",
     "betmgm": "BetMGM",
+    "bet_mgm": "BetMGM",
     "caesars": "Caesars",
     "pinnacle": "Pinnacle",
     "espnbet": "ESPN BET",
+    "espn_bet": "ESPN BET",
     "betrivers": "BetRivers",
+    "bet_rivers": "BetRivers",
     "prizepicks": "PrizePicks",
+    "prize_picks": "PrizePicks",
     "underdog": "Underdog Fantasy",
+    "underdog_fantasy": "Underdog Fantasy",
+}
+
+LINE_SOURCE_OPTIONS = [
+    "Consensus",
+    "PrizePicks",
+    "Hard Rock Bet",
+    "FanDuel",
+    "DraftKings",
+    "BetMGM",
+    "Caesars",
+    "ESPN BET",
+    "BetRivers",
+    "Underdog Fantasy",
+]
+
+LINE_SOURCE_DEFAULT_BOOKMAKER_IDS = {
+    "PrizePicks": ("prizepicks",),
+    "Hard Rock Bet": ("hardrockbet",),
+    "FanDuel": ("fanduel",),
+    "DraftKings": ("draftkings",),
+    "BetMGM": ("betmgm",),
+    "Caesars": ("caesars",),
+    "ESPN BET": ("espnbet",),
+    "BetRivers": ("betrivers",),
+    "Underdog Fantasy": ("underdog",),
 }
 
 DEFAULT_STAT_SDS = {"Points": 5.5, "Rebounds": 2.7, "Assists": 2.2, "PRA": 7.5}
@@ -773,6 +806,10 @@ def _first_value(source: dict[str, Any], keys: list[str], default: Any = None) -
     return default
 
 
+def _compact_bookmaker(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
 def _sgo_request(api_key: str, path: str, params: dict[str, Any] | None = None, timeout: int = 30) -> requests.Response:
     url = f"{SPORTSGAMEODDS_API_BASE}{path}"
     response = requests.get(url, params=params or {}, headers=_sgo_headers(api_key), timeout=timeout)
@@ -1066,8 +1103,8 @@ def fetch_sportsgameodds_event_props(
             price = pd.to_numeric(pd.Series([book_data.get("odds")]), errors="coerce").iloc[0]
             if pd.isna(line):
                 continue
-            book_key = str(bookmaker_id or "").lower().replace(" ", "_")
-            book_label = BOOKMAKER_LABELS.get(book_key, str(bookmaker_id))
+            book_key = str(bookmaker_id or "").lower().replace(" ", "_").replace("-", "_")
+            book_label = BOOKMAKER_LABELS.get(book_key, BOOKMAKER_LABELS.get(_compact_bookmaker(bookmaker_id), str(bookmaker_id)))
             rows.append({
                 "EventID": str(event_id),
                 "SportsGameOddsEventID": str(event_id),
@@ -1110,7 +1147,10 @@ def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]
         return {}
     data = group.copy()
     if source_mode != "Consensus":
-        data = data[data["Bookmaker"].eq(source_mode)]
+        wanted = _compact_bookmaker(source_mode)
+        bookmaker_label_key = data["Bookmaker"].map(_compact_bookmaker) if "Bookmaker" in data.columns else pd.Series([], dtype=str)
+        bookmaker_id_key = data["BookmakerKey"].map(_compact_bookmaker) if "BookmakerKey" in data.columns else pd.Series([], dtype=str)
+        data = data[(bookmaker_label_key.eq(wanted)) | (bookmaker_id_key.eq(wanted))]
         if data.empty:
             return {}
     lines = pd.to_numeric(data["Line"], errors="coerce").dropna()
@@ -1724,8 +1764,17 @@ with st.sidebar:
     st.divider()
     st.subheader("Automatic prop lines")
     sgo_api_key = st.text_input("SportsGameOdds API key (session only)", type="password")
-    odds_source_mode = st.selectbox("Line source", ["Consensus"])
-    sgo_bookmakers_text = st.text_input("Optional SportsGameOdds bookmaker IDs", value="", help="Comma-separated IDs like hardrockbet,fanduel,draftkings. Leave blank for all available books.")
+    odds_source_mode = st.selectbox(
+        "Line source",
+        LINE_SOURCE_OPTIONS,
+        index=LINE_SOURCE_OPTIONS.index("PrizePicks") if "PrizePicks" in LINE_SOURCE_OPTIONS else 0,
+        help="Choose Consensus or a specific provider. Pick PrizePicks if you only want PrizePicks lines on the board.",
+    )
+    sgo_bookmakers_text = st.text_input(
+        "Optional SportsGameOdds bookmaker IDs",
+        value="",
+        help="Comma-separated IDs like prizepicks,hardrockbet,fanduel,draftkings. Leave blank and the selected Line source will be used when possible.",
+    )
 
     if st.button("Clear cached data", width="stretch"):
         st.cache_data.clear()
@@ -1824,6 +1873,8 @@ with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
     odds_games = st.multiselect("Games to query", board["Game"].drop_duplicates().tolist(), default=board["Game"].drop_duplicates().tolist())
     include_alt_lines = st.checkbox("Include alt lines", value=False, help="Usually leave this off for main prop-line comparison. Turn on if you want alternate lines included in the raw quotes.")
     st.caption("SportsGameOdds uses the /v2/events endpoint. Player props are inside each event's odds object; statEntityID identifies the player, statID identifies the stat, and each bookmaker quote carries the line in overUnder.")
+    if odds_source_mode != "Consensus":
+        st.info(f"Line source is set to {odds_source_mode}. Fetches will request that provider when SportsGameOdds supports its bookmaker ID, and the board will ignore other providers for line/edge columns.")
 
     if sgo_api_key:
         if st.button("Find SportsGameOdds WNBA event IDs", width="stretch"):
@@ -1884,6 +1935,8 @@ with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
                 event_lookup = sgo_events.set_index("Game")["SportsGameOddsEventID"].astype(str).to_dict() if not sgo_events.empty else {}
                 event_lookup.update(manual_lookup)
                 bookmaker_ids = tuple(v.strip().lower().replace(" ", "") for v in str(sgo_bookmakers_text or "").split(",") if v.strip())
+                if not bookmaker_ids and odds_source_mode != "Consensus":
+                    bookmaker_ids = LINE_SOURCE_DEFAULT_BOOKMAKER_IDS.get(odds_source_mode, ())
                 wanted_markets = {market_options[target] for target in selected_markets}
                 frames = []
                 last_meta: dict[str, str] = {"provider": "SportsGameOdds"}
