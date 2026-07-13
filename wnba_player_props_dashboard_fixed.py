@@ -865,24 +865,29 @@ def _bdl_request(api_key: str, path: str, params: dict[str, Any] | None = None, 
     return response
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_balldontlie_events(api_key: str, slate_date: date) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Use BallDontLie odds-by-date to discover BallDontLie game IDs for the slate."""
-    if not api_key:
-        return pd.DataFrame(), {}
-    response = _bdl_request(api_key, "/odds", {"dates": [slate_date.isoformat()], "per_page": 100})
-    payload = response.json()
+def _normalize_bdl_game_payload(payload: dict[str, Any], slate_date: date, source: str) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Normalize BallDontLie game/event-style payloads into board game rows."""
+    data = payload.get("data", []) if isinstance(payload, dict) else []
     rows: list[dict[str, Any]] = []
-    for item in payload.get("data", []) or []:
+    for item in data or []:
         if not isinstance(item, dict):
             continue
         game = item.get("game") if isinstance(item.get("game"), dict) else item
-        game_id = _first_value(item, ["game_id", "gameId", "gameID"], None) or _first_value(game, ["id", "game_id", "gameId"], None)
-        home = _bdl_team_code(_first_value(game, ["home_team", "home", "home_team_abbreviation", "home_team_name"], {}))
-        away = _bdl_team_code(_first_value(game, ["visitor_team", "away_team", "away", "away_team_abbreviation", "visitor_team_name"], {}))
+        if not isinstance(game, dict):
+            game = item
+        game_id = (
+            _first_value(item, ["game_id", "gameId", "gameID", "id"], None)
+            or _first_value(game, ["id", "game_id", "gameId", "gameID"], None)
+        )
+        home = _bdl_team_code(_first_value(game, [
+            "home_team", "home", "home_team_abbreviation", "home_team_name", "home_team_code"
+        ], {}))
+        away = _bdl_team_code(_first_value(game, [
+            "visitor_team", "away_team", "away", "away_team_abbreviation", "visitor_team_name", "visitor_team_code"
+        ], {}))
         if home not in TEAM_NAMES or away not in TEAM_NAMES or not game_id:
             continue
-        game_time = _first_value(game, ["date", "datetime", "game_time", "start_time"], "")
+        game_time = _first_value(game, ["date", "datetime", "game_time", "start_time", "scheduled"], "")
         rows.append({
             "BallDontLieGameID": str(game_id),
             "EventID": str(game_id),
@@ -891,11 +896,47 @@ def fetch_balldontlie_events(api_key: str, slate_date: date) -> tuple[pd.DataFra
             "Away": away,
             "Home": home,
             "Game": f"{away} @ {home}",
-            "Source": "BallDontLie odds",
+            "Source": source,
         })
     frame = pd.DataFrame(rows).drop_duplicates(["BallDontLieGameID"]) if rows else pd.DataFrame()
-    meta = {"provider": "BallDontLie", "objects": str(len(payload.get("data", []) or []))}
+    meta_obj = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
+    meta = {"provider": "BallDontLie", "endpoint": source, "objects": str(len(data or [])), **{str(k): str(v) for k, v in meta_obj.items()}}
     return frame, meta
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_balldontlie_events(api_key: str, slate_date: date) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Discover BallDontLie WNBA game IDs for the slate without using player-prop odds.
+
+    The live player props endpoint requires a BallDontLie game_id. The old version tried
+    /wnba/v1/odds?dates=..., which can return HTTP 400. This function now tries game-style
+    endpoints first and safely returns an empty frame if the user's plan/API does not expose
+    game lookup. Manual game IDs can still be used in the UI.
+    """
+    if not api_key:
+        return pd.DataFrame(), {}
+
+    date_str = slate_date.isoformat()
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        ("/games", {"dates[]": date_str, "per_page": 100}),
+        ("/games", {"dates": [date_str], "per_page": 100}),
+        ("/games", {"start_date": date_str, "end_date": date_str, "per_page": 100}),
+        ("/schedule", {"dates[]": date_str, "per_page": 100}),
+    ]
+    errors: list[str] = []
+    for path, params in attempts:
+        try:
+            response = _bdl_request(api_key, path, params, timeout=20)
+            payload = response.json()
+            frame, meta = _normalize_bdl_game_payload(payload, slate_date, f"BallDontLie {path}")
+            if not frame.empty:
+                return frame, meta
+            errors.append(f"{path}: no games returned")
+        except Exception as exc:
+            errors.append(f"{path}: {type(exc).__name__}: {exc}")
+            continue
+
+    return pd.DataFrame(), {"provider": "BallDontLie", "endpoint": "game lookup", "errors": " | ".join(errors[:4])}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1692,7 +1733,7 @@ with st.expander("Automatic BallDontLie prop-line fetch", expanded=False):
     market_options = {target: config["market"] for target, config in TARGETS.items()}
     selected_markets = st.multiselect("Markets", list(market_options), default=list(market_options))
     odds_games = st.multiselect("Games to query", board["Game"].drop_duplicates().tolist(), default=board["Game"].drop_duplicates().tolist())
-    st.caption("BallDontLie returns all live player props for a game. Player props are live and may be removed near game completion.")
+    st.caption("BallDontLie player props require a BallDontLie game_id. Use Find IDs first; if your API plan blocks game lookup, paste manual IDs below. Player props are live and may be removed near game completion.")
 
     if bdl_api_key:
         if st.button("Find BallDontLie game IDs", width="stretch"):
@@ -1735,11 +1776,17 @@ with st.expander("Automatic BallDontLie prop-line fetch", expanded=False):
             st.error("Enter your temporary BallDontLie API key in the sidebar.")
         else:
             try:
-                if bdl_events.empty:
+                manual_lookup = _manual_bdl_id_lookup(manual_bdl_ids)
+                if bdl_events.empty and not manual_lookup:
                     bdl_events, meta = fetch_balldontlie_events(bdl_api_key, slate_date)
                     st.session_state["wnba_balldontlie_events"] = bdl_events
+                    st.session_state["wnba_odds_meta"] = meta
+                elif bdl_events.empty and manual_lookup:
+                    # Manual IDs are enough to fetch props; do not make a game-lookup request that could 400.
+                    meta = {"provider": "BallDontLie", "endpoint": "manual game IDs"}
+                    st.session_state["wnba_odds_meta"] = meta
                 event_lookup = bdl_events.set_index("Game")["BallDontLieGameID"].astype(str).to_dict() if not bdl_events.empty else {}
-                event_lookup.update(_manual_bdl_id_lookup(manual_bdl_ids))
+                event_lookup.update(manual_lookup)
                 vendors = tuple(v.strip() for v in str(bdl_vendors_text or "").split(",") if v.strip())
                 wanted_markets = {market_options[target] for target in selected_markets}
                 frames = []
