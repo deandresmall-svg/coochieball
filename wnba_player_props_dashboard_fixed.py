@@ -818,6 +818,7 @@ def normalize_balldontlie_market(value: Any) -> str:
         "points_rebounds_assists": "player_points_rebounds_assists",
         "points_+_rebounds_+_assists": "player_points_rebounds_assists",
         "pra": "player_points_rebounds_assists",
+        "player_pra": "player_points_rebounds_assists",
         "player_points_rebounds_assists": "player_points_rebounds_assists",
     }
     return aliases.get(text, text)
@@ -829,7 +830,7 @@ def _extract_bdl_line_odds(prop: dict[str, Any]) -> tuple[float, float, float, s
     under_odds = _first_value(prop, ["under_odds", "under_price", "under_american", "under", "price_under"], np.nan)
     side = str(_first_value(prop, ["side", "outcome", "selection", "label", "name"], "") or "").title()
 
-    outcomes = prop.get("outcomes") or prop.get("markets") or prop.get("prices") or []
+    outcomes = prop.get("outcomes") or prop.get("markets") or prop.get("odds") or prop.get("prices") or prop.get("lines") or []
     for outcome in _as_list(outcomes):
         if not isinstance(outcome, dict):
             continue
@@ -856,6 +857,54 @@ def _extract_bdl_line_odds(prop: dict[str, Any]) -> tuple[float, float, float, s
         pd.to_numeric(pd.Series([under_odds]), errors="coerce").iloc[0],
         side,
     )
+
+
+def _without_collection_fields(source: dict[str, Any]) -> dict[str, Any]:
+    """Keep scalar/object fields from a BallDontLie item while dropping nested market arrays."""
+    skip = {"markets", "outcomes", "prices", "lines", "odds", "bookmakers", "sportsbooks", "vendors"}
+    return {key: value for key, value in source.items() if key not in skip}
+
+
+def _expand_balldontlie_prop_items(items: list[Any]) -> list[dict[str, Any]]:
+    """Flatten the common player-prop payload shapes used by odds APIs.
+
+    BallDontLie may return one row per prop, one row per vendor with nested markets,
+    or one row per market with nested over/under outcomes.  This helper keeps the
+    downstream parser independent from the exact nesting shape.
+    """
+    expanded: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        base = _without_collection_fields(item)
+
+        # Vendor/bookmaker wrapper: {player, bookmakers:[{name, markets:[...]}]}
+        vendor_groups = item.get("bookmakers") or item.get("sportsbooks") or item.get("vendors")
+        if isinstance(vendor_groups, list) and vendor_groups and all(isinstance(v, dict) for v in vendor_groups):
+            for vendor in vendor_groups:
+                vendor_base = {**base}
+                vendor_base["vendor"] = vendor
+                nested_markets = vendor.get("markets") or vendor.get("odds") or vendor.get("lines") or vendor.get("prices")
+                if isinstance(nested_markets, list):
+                    for market in nested_markets:
+                        if isinstance(market, dict):
+                            expanded.append({**vendor_base, **market})
+                else:
+                    expanded.append({**vendor_base, **_without_collection_fields(vendor)})
+            continue
+
+        # Market wrapper: {player, markets:[{prop_type, line, outcomes:[...]}]}
+        nested_markets = item.get("markets")
+        if isinstance(nested_markets, list) and nested_markets and all(isinstance(m, dict) for m in nested_markets):
+            for market in nested_markets:
+                rec = {**base, **market}
+                if "player" not in rec and "player" in item:
+                    rec["player"] = item["player"]
+                expanded.append(rec)
+            continue
+
+        expanded.append(item)
+    return expanded
 
 
 def _bdl_request(api_key: str, path: str, params: dict[str, Any] | None = None, timeout: int = 25) -> requests.Response:
@@ -955,8 +1004,10 @@ def fetch_balldontlie_player_props(
         params["vendors"] = list(vendors)
     response = _bdl_request(api_key, "/odds/player_props", params, timeout=30)
     payload = response.json()
+    raw_items = payload.get("data", []) or []
+    expanded_items = _expand_balldontlie_prop_items(raw_items)
     rows: list[dict[str, Any]] = []
-    for prop in payload.get("data", []) or []:
+    for prop in expanded_items:
         if not isinstance(prop, dict):
             continue
         player = prop.get("player") or prop.get("athlete") or {}
@@ -1003,7 +1054,13 @@ def fetch_balldontlie_player_props(
                 "MarketType": market_type, "Source": "BallDontLie",
             })
     meta_obj = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
-    meta = {"provider": "BallDontLie", "count": str(len(payload.get("data", []) or [])), **{str(k): str(v) for k, v in meta_obj.items()}}
+    meta = {
+        "provider": "BallDontLie",
+        "raw_count": str(len(raw_items)),
+        "expanded_count": str(len(expanded_items)),
+        "parsed_quote_rows": str(len(rows)),
+        **{str(k): str(v) for k, v in meta_obj.items()},
+    }
     return pd.DataFrame(rows), meta
 
 
@@ -1792,12 +1849,19 @@ with st.expander("Automatic BallDontLie prop-line fetch", expanded=False):
                 frames = []
                 last_meta: dict[str, str] = {"provider": "BallDontLie"}
                 missing_games = []
+                debug_fetch_rows: list[dict[str, Any]] = []
                 for game in odds_games:
                     bdl_game_id = event_lookup.get(game)
                     if not bdl_game_id:
                         missing_games.append(game)
                         continue
-                    frame, last_meta = fetch_balldontlie_player_props(bdl_api_key, str(bdl_game_id), "", vendors)
+                    game_frames: list[pd.DataFrame] = []
+                    for market in sorted(wanted_markets):
+                        frame, last_meta = fetch_balldontlie_player_props(bdl_api_key, str(bdl_game_id), market, vendors)
+                        debug_fetch_rows.append({"Game": game, "BallDontLieGameID": str(bdl_game_id), "Market": market, **last_meta})
+                        if frame is not None and not frame.empty:
+                            game_frames.append(frame)
+                    frame = pd.concat(game_frames, ignore_index=True) if game_frames else pd.DataFrame()
                     if not frame.empty:
                         frame = frame[frame["Market"].isin(wanted_markets)].copy()
                         # Re-key the quote rows to the board's event ID so player lines merge correctly.
@@ -1805,6 +1869,8 @@ with st.expander("Automatic BallDontLie prop-line fetch", expanded=False):
                         if len(board_event_ids):
                             frame["EventID"] = board_event_ids[0]
                     frames.append(frame)
+                if debug_fetch_rows:
+                    st.session_state["wnba_balldontlie_fetch_debug"] = pd.DataFrame(debug_fetch_rows)
                 combined = combine_odds_frames(frames)
                 st.session_state["wnba_odds"] = combined
                 st.session_state["wnba_odds_meta"] = last_meta
@@ -1818,6 +1884,10 @@ with st.expander("Automatic BallDontLie prop-line fetch", expanded=False):
     meta = st.session_state.get("wnba_odds_meta", {})
     if meta:
         st.caption("BallDontLie meta: " + " · ".join(f"{k}: {v}" for k, v in meta.items() if v))
+    debug_fetch = st.session_state.get("wnba_balldontlie_fetch_debug", pd.DataFrame())
+    if isinstance(debug_fetch, pd.DataFrame) and not debug_fetch.empty:
+        with st.expander("BallDontLie fetch debug", expanded=False):
+            st.dataframe(debug_fetch, hide_index=True, width="stretch")
 
 odds = st.session_state.get("wnba_odds", pd.DataFrame())
 board = apply_market_quotes(board, odds, odds_source_mode)
