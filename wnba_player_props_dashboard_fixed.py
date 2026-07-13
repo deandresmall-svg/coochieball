@@ -1155,54 +1155,93 @@ def combine_odds_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 PRIZEPICKS_EXPORT_SCRIPT = r'''
 (() => {
-  const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const norm = (s) => (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
   const rawText = document.body.innerText || "";
-  const candidates = [...document.querySelectorAll(
-    '[data-testid*="projection"], [data-projection-id], [data-projectionid], [class*="projection"], [class*="Projection"], [class*="card"], button, article'
-  )];
-  const markets = ["Points", "Pts", "Rebounds", "Rebs", "Assists", "Asts", "Pts+Rebs+Asts", "Pts + Rebs + Asts", "PRA"];
-  const marketRegex = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${markets.map(x => x.replace(/[+]/g, "\\+")).join("|")})`, "i");
+  const selector = [
+    '[data-testid*="projection"]', '[data-testid*="Projection"]',
+    '[data-projection-id]', '[data-projectionid]', '[data-testid*="player"]',
+    '[class*="projection"]', '[class*="Projection"]', '[class*="pick"]',
+    '[class*="card"]', '[role="button"]', 'button', 'article'
+  ].join(', ');
+  const marketWords = [
+    "Points", "Pts", "Rebounds", "Rebs", "Assists", "Asts",
+    "Pts+Rebs+Asts", "Pts + Rebs + Asts", "Pts Rebs Asts",
+    "Points+Rebounds+Assists", "PRA"
+  ];
+  const marketAlternation = marketWords.map(x => x.replace(/[+]/g, "\\+").replace(/\s+/g, "\\s*")).join("|");
+  const lineMarketRegex = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i");
+  const marketLineRegex = new RegExp(`(${marketAlternation})\\s*(\\d+(?:\\.\\d+)?)`, "i");
   function marketName(m) {
     const x = (m || "").toLowerCase().replace(/\s+/g, "");
     if (x === "points" || x === "pts") return "Points";
     if (x === "rebounds" || x === "rebs") return "Rebounds";
     if (x === "assists" || x === "asts") return "Assists";
-    if (x.includes("pts+rebs+asts") || x === "pra") return "PRA";
+    if (x.includes("pts+rebs+asts") || x.includes("points+rebounds+assists") || x.includes("ptsrebsasts") || x === "pra") return "PRA";
     return m;
   }
+  function isNameLine(s) {
+    const x = norm(s);
+    if (!x || x.length < 3 || x.length > 45) return false;
+    if (/\d/.test(x)) return false;
+    if (/^(WNBA|NBA|More|Less|Goblin|Demon|Discount|Fantasy Score|Projected|Search|Today|Tomorrow|Live)$/i.test(x)) return false;
+    if (marketWords.some(w => x.toLowerCase() === w.toLowerCase())) return false;
+    return /^[A-Za-z .'’\-]+$/.test(x);
+  }
   function parseBlock(text) {
-    text = (text || "").replace(/\r/g, "\n");
-    const match = text.match(marketRegex);
-    if (!match) return null;
-    const line = parseFloat(match[1]);
-    const market = marketName(match[2]);
-    const lines = text.split("\n").map(norm).filter(Boolean);
-    const marketIndex = lines.findIndex(l => marketRegex.test(l));
-    let player = "";
-    for (let i = Math.max(0, marketIndex - 4); i < marketIndex; i++) {
-      const cand = lines[i] || "";
-      if (/^[A-Za-z .'’-]{3,}$/.test(cand) && !/^(WNBA|More|Less|Goblin|Demon|Discount)$/i.test(cand)) player = cand;
+    const raw = (text || "").replace(/\r/g, "\n");
+    const spaced = raw
+      .replace(/\b(More|Less|Goblin|Demon|Discount|Points|Pts|Rebounds|Rebs|Assists|Asts|PRA)\b/g, "\n$1\n")
+      .replace(/(\d+(?:\.\d+)?)/g, "\n$1\n");
+    const lines = spaced.split("\n").map(norm).filter(Boolean);
+    let best = null;
+    for (let i = 0; i < lines.length; i++) {
+      const joined3 = lines.slice(i, Math.min(lines.length, i + 3)).join(" ");
+      let line = null, market = null;
+      let m = joined3.match(lineMarketRegex);
+      if (m) { line = parseFloat(m[1]); market = marketName(m[2]); }
+      if (!m) {
+        m = joined3.match(marketLineRegex);
+        if (m) { market = marketName(m[1]); line = parseFloat(m[2]); }
+      }
+      if (!m || !Number.isFinite(line)) continue;
+      let player = "";
+      for (let j = i - 1; j >= Math.max(0, i - 10); j--) {
+        if (isNameLine(lines[j])) { player = lines[j]; break; }
+      }
+      if (!player) continue;
+      const windowText = lines.slice(Math.max(0, i - 8), Math.min(lines.length, i + 8)).join(" ").toLowerCase();
+      const promo_type = windowText.includes("goblin") ? "goblin" : windowText.includes("demon") ? "demon" : windowText.includes("discount") ? "discount" : "normal";
+      best = { player, market, line, promo_type, raw_text: raw.slice(0, 1200) };
+      break;
     }
-    if (!player) {
-      const before = text.slice(0, match.index).split("\n").map(norm).filter(Boolean);
-      player = before.reverse().find(x => /^[A-Za-z .'’-]{3,}$/.test(x)) || "";
-    }
-    const lower = text.toLowerCase();
-    const promo_type = lower.includes("goblin") ? "goblin" : lower.includes("demon") ? "demon" : lower.includes("discount") ? "discount" : "normal";
-    if (!player || !Number.isFinite(line)) return null;
-    return { player, market, line, promo_type, raw_text: text.slice(0, 1000) };
+    return best;
   }
   const rows = [];
   const seen = new Set();
-  for (const el of candidates) {
-    const txt = norm(el.innerText || el.textContent || "");
-    if (!txt || txt.length < 12 || txt.length > 1500) continue;
-    const parsed = parseBlock(txt.replace(/ More /g, "\nMore\n").replace(/ Less /g, "\nLess\n"));
-    if (!parsed) continue;
-    const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
-    if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
+  const elements = [...document.querySelectorAll(selector)].map((el, idx) => {
+    const visible_text = el.innerText || el.textContent || "";
+    const parsed = parseBlock(visible_text);
+    if (parsed) {
+      const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
+      if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
+    }
+    return {
+      idx,
+      tag: el.tagName,
+      visible_text: visible_text.slice(0, 1500),
+      attributes: Object.fromEntries([...el.attributes].slice(0, 30).map(a => [a.name, a.value]))
+    };
+  });
+  if (rows.length === 0) {
+    const blocks = rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g);
+    for (const block of blocks) {
+      const parsed = parseBlock(block);
+      if (!parsed) continue;
+      const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
+      if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
+    }
   }
-  const payload = { exported_at: new Date().toISOString(), page_url: window.location.href, source: "PrizePicks browser export", rows, raw_text: rawText };
+  const payload = { exported_at: new Date().toISOString(), page_url: window.location.href, source: "PrizePicks browser export v2", rows, elements, raw_text: rawText };
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const link = document.createElement("a");
@@ -1213,6 +1252,7 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
   console.log(`Exported ${rows.length} PrizePicks rows`, rows);
 })();
 '''
+
 
 
 def _string_or_blank(value: Any) -> str:
@@ -1296,6 +1336,95 @@ def _player_lookup_from_prizepicks_json(payload: Any) -> dict[str, str]:
     return lookup
 
 
+def _is_probable_player_name(value: Any) -> bool:
+    text = _string_or_blank(value)
+    if len(text) < 3 or len(text) > 50:
+        return False
+    if re.search(r"\d", text):
+        return False
+    blocked = {
+        "WNBA", "NBA", "MORE", "LESS", "GOBLIN", "DEMON", "DISCOUNT", "TODAY", "TOMORROW",
+        "FANTASY SCORE", "SEARCH", "PROJECTED", "PROJECTIONS", "POPULAR", "BOARD",
+    }
+    if normalize_text(text) in blocked:
+        return False
+    if prizepicks_market_to_dashboard(text):
+        return False
+    return bool(re.match(r"^[A-Za-z .'’\-]+$", text.strip()))
+
+
+def _parse_prizepicks_text_rows(text: str) -> list[dict[str, Any]]:
+    """Fallback parser for PrizePicks page text when the browser script exports raw_text but no rows."""
+    if not text:
+        return []
+    cleaned = str(text).replace("\r", "\n").replace("\u00a0", " ")
+    cleaned = re.sub(r"\b(More|Less|Goblin|Demon|Discount|Points|Pts|Rebounds|Rebs|Assists|Asts|PRA)\b", r"\n\1\n", cleaned, flags=re.I)
+    cleaned = re.sub(r"(\d+(?:\.\d+)?)", r"\n\1\n", cleaned)
+    lines = [re.sub(r"\s+", " ", x).strip() for x in cleaned.splitlines()]
+    lines = [x for x in lines if x]
+    market_terms = r"Points|Pts|Rebounds|Rebs|Assists|Asts|Pts\s*\+\s*Rebs\s*\+\s*Asts|Pts\s+Rebs\s+Asts|Points\s*\+\s*Rebounds\s*\+\s*Assists|PRA"
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, float, str]] = set()
+
+    def add_row(player: str, market: str, line: float, promo: str, raw_window: str) -> None:
+        market_key = prizepicks_market_to_dashboard(market)
+        if not player or not market_key or not np.isfinite(line):
+            return
+        key = (normalize_player_name(player), market_key, round(float(line), 2), promo)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({"player": player, "market": market, "line": float(line), "promo_type": promo, "raw_text": raw_window[:1000]})
+
+    for i in range(len(lines)):
+        window = " ".join(lines[i:min(len(lines), i + 4)])
+        line_val = np.nan
+        market_val = ""
+        match = re.search(rf"(?P<line>\d+(?:\.\d+)?)\s*(?P<market>{market_terms})\b", window, flags=re.I)
+        if match:
+            line_val = float(match.group("line"))
+            market_val = match.group("market")
+        else:
+            match = re.search(rf"(?P<market>{market_terms})\b\s*(?P<line>\d+(?:\.\d+)?)", window, flags=re.I)
+            if match:
+                line_val = float(match.group("line"))
+                market_val = match.group("market")
+        if not market_val or not np.isfinite(line_val):
+            continue
+        player = ""
+        for j in range(i - 1, max(-1, i - 12), -1):
+            if _is_probable_player_name(lines[j]):
+                player = lines[j]
+                break
+        if not player:
+            continue
+        promo_window = " ".join(lines[max(0, i - 10):min(len(lines), i + 10)]).lower()
+        promo = "goblin" if "goblin" in promo_window else "demon" if "demon" in promo_window else "discount" if "discount" in promo_window else "normal"
+        add_row(player, market_val, line_val, promo, promo_window)
+    return rows
+
+
+def _payload_text_sources(payload: Any) -> list[str]:
+    texts: list[str] = []
+    if isinstance(payload, dict):
+        for key in ["raw_text", "detail_text", "text", "visible_text", "body_text"]:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+        elements = payload.get("elements")
+        if isinstance(elements, list):
+            for element in elements:
+                if isinstance(element, dict):
+                    for key in ["visible_text", "direct_text", "innerText", "text", "textContent"]:
+                        value = element.get(key)
+                        if isinstance(value, str) and value.strip():
+                            texts.append(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            texts.extend(_payload_text_sources(item))
+    return texts
+
+
 def parse_prizepicks_payload(payload: Any) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     player_lookup = _player_lookup_from_prizepicks_json(payload)
@@ -1308,8 +1437,11 @@ def parse_prizepicks_payload(payload: Any) -> pd.DataFrame:
         if not isinstance(attrs, dict):
             continue
         line = _first_present(attrs, ["line_score", "line", "value", "over_under", "projection", "target", "score"])
-        stat = _first_present(attrs, ["stat_type", "stat", "market", "prop_type", "projection_type", "category"])
-        player = _first_present(attrs, ["player_name", "player", "name", "athlete", "display_name", "participant_name"])
+        stat = _first_present(attrs, ["stat_type", "stat", "market", "prop_type", "projection_type", "category", "name"])
+        player = _first_present(attrs, ["player_name", "player", "athlete", "participant_name", "playerName"])
+        possible_name = _first_present(attrs, ["display_name", "name", "description"])
+        if not player and possible_name and not prizepicks_market_to_dashboard(possible_name):
+            player = possible_name
         if not player and isinstance(item.get("relationships"), dict):
             rel = item.get("relationships") or {}
             for rel_key in ["new_player", "player", "athlete"]:
@@ -1321,9 +1453,12 @@ def parse_prizepicks_payload(payload: Any) -> pd.DataFrame:
                         break
         if player and stat and line is not None:
             rows.append({"player": player, "market": stat, "line": line, "promo_type": _prizepicks_promo_type(attrs), "raw_json": json.dumps(item, default=str)[:1000]})
+    for text_source in _payload_text_sources(payload):
+        rows.extend(_parse_prizepicks_text_rows(text_source))
+
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return pd.DataFrame(columns=["Player", "NameKey", "Market", "Line", "PromoType"])
+        return pd.DataFrame(columns=["Player", "NameKey", "Market", "Line", "PromoType", "TeamRaw", "MarketRaw"])
     colmap = {str(c).lower().replace(" ", "_"): c for c in frame.columns}
     def col(*names: str) -> str | None:
         for name in names:
@@ -1331,13 +1466,13 @@ def parse_prizepicks_payload(payload: Any) -> pd.DataFrame:
             if key in colmap:
                 return colmap[key]
         return None
-    player_col = col("player", "player_name", "name", "athlete", "participant", "display_name")
+    player_col = col("player", "player_name", "name", "athlete", "participant", "display_name", "participant_name")
     market_col = col("market", "stat", "stat_type", "prop_type", "projection_type", "category")
     line_col = col("line", "line_score", "value", "over_under", "projection", "target")
     promo_col = col("promo_type", "type", "line_type", "discount_type")
     team_col = col("team", "team_abbr", "team_name")
     if not player_col or not market_col or not line_col:
-        return pd.DataFrame(columns=["Player", "NameKey", "Market", "Line", "PromoType"])
+        return pd.DataFrame(columns=["Player", "NameKey", "Market", "Line", "PromoType", "TeamRaw", "MarketRaw"])
     out = pd.DataFrame({
         "Player": frame[player_col].map(_string_or_blank),
         "MarketRaw": frame[market_col].map(_string_or_blank),
@@ -1382,30 +1517,68 @@ def parse_prizepicks_upload(uploaded: Any) -> pd.DataFrame:
     return parse_prizepicks_payload(rows)
 
 
+def _name_similarity(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    a_key = normalize_player_name(a)
+    b_key = normalize_player_name(b)
+    if not a_key or not b_key:
+        return 0.0
+    if a_key == b_key:
+        return 1.0
+    a_tokens = a_key.split()
+    b_tokens = b_key.split()
+    if len(a_tokens) >= 2 and len(b_tokens) >= 2:
+        if a_tokens[-1] == b_tokens[-1] and a_tokens[0][:1] == b_tokens[0][:1]:
+            return max(0.92, SequenceMatcher(None, a_key, b_key).ratio())
+    return SequenceMatcher(None, a_key, b_key).ratio()
+
+
 def prizepicks_rows_to_odds_frame(pp_rows: pd.DataFrame, board: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if pp_rows is None or pp_rows.empty or board is None or board.empty:
         return pd.DataFrame(), pd.DataFrame()
     rows: list[dict[str, Any]] = []
     debug_rows: list[dict[str, Any]] = []
     board_lookup = board.copy()
-    board_lookup["NameKey"] = board_lookup["NameKey"].fillna(board_lookup["Player"].map(normalize_player_name))
+    if "NameKey" not in board_lookup.columns:
+        board_lookup["NameKey"] = board_lookup["Player"].map(normalize_player_name)
+    else:
+        board_lookup["NameKey"] = board_lookup["NameKey"].fillna(board_lookup["Player"].map(normalize_player_name))
     for _, pp in pp_rows.iterrows():
-        matches = board_lookup[board_lookup["NameKey"].eq(str(pp["NameKey"]))].copy()
+        pp_key = str(pp.get("NameKey", normalize_player_name(pp.get("Player", ""))))
+        matches = board_lookup[board_lookup["NameKey"].eq(pp_key)].copy()
+        match_type = "exact"
+        best_name = ""
+        best_score = 0.0
+        if matches.empty:
+            scored = board_lookup[["Player", "NameKey"]].drop_duplicates().copy()
+            scored["NameScore"] = scored["NameKey"].map(lambda x: _name_similarity(pp_key, str(x)))
+            scored = scored.sort_values("NameScore", ascending=False)
+            if not scored.empty:
+                best_name = str(scored.iloc[0]["Player"])
+                best_score = float(scored.iloc[0]["NameScore"])
+                if best_score >= 0.88:
+                    matches = board_lookup[board_lookup["NameKey"].eq(str(scored.iloc[0]["NameKey"]))].copy()
+                    match_type = "fuzzy"
         team_raw = normalize_team(pp.get("TeamRaw", "")) if "TeamRaw" in pp_rows.columns else ""
         if team_raw and "Team" in matches.columns:
             team_matches = matches[matches["Team"].map(normalize_team).eq(team_raw)]
             if not team_matches.empty:
                 matches = team_matches
-        debug_rows.append({"Player": pp.get("Player"), "Market": pp.get("MarketRaw", pp.get("Market")), "Line": pp.get("Line"), "PromoType": pp.get("PromoType", "normal"), "MatchedBoardRows": int(len(matches))})
+        debug_rows.append({
+            "Player": pp.get("Player"), "Market": pp.get("MarketRaw", pp.get("Market")), "Line": pp.get("Line"),
+            "PromoType": pp.get("PromoType", "normal"), "NameKey": pp_key,
+            "MatchedBoardRows": int(len(matches)), "MatchType": match_type if len(matches) else "none",
+            "BestBoardName": best_name, "BestNameScore": round(best_score, 3),
+        })
         for _, match in matches.iterrows():
             for side in ["over", "under"]:
                 rows.append({
-                    "EventID": str(match["EventID"]), "Game": match.get("Game", ""), "NameKey": str(pp["NameKey"]),
+                    "EventID": str(match["EventID"]), "Game": match.get("Game", ""), "NameKey": str(match["NameKey"]),
                     "Player": pp.get("Player", match.get("Player", "")), "Team": match.get("Team", ""),
                     "Market": pp["Market"], "Bookmaker": "PrizePicks", "BookmakerKey": "prizepicks",
                     "Side": side, "Line": float(pp["Line"]), "Odds": np.nan, "Updated": "",
                     "MarketType": str(pp.get("PromoType", "normal")), "Source": "PrizePicks upload",
-                    "OddID": f"pp-upload-{match.get('EventID', '')}-{pp['NameKey']}-{pp['Market']}-{side}",
+                    "OddID": f"pp-upload-{match.get('EventID', '')}-{pp_key}-{pp['Market']}-{side}",
                 })
     odds = pd.DataFrame(rows).drop_duplicates(["EventID", "BookmakerKey", "Market", "NameKey", "Side", "Line"], keep="last") if rows else pd.DataFrame()
     return odds, pd.DataFrame(debug_rows)
@@ -2181,7 +2354,7 @@ with st.expander("PrizePicks line import — recommended", expanded=False):
                     existing_odds = pd.DataFrame()
                 st.session_state["wnba_odds"] = combine_odds_frames([existing_odds, pp_odds])
                 if pp_rows.empty:
-                    st.warning("The upload did not contain parseable PrizePicks rows. Try the browser script export or a CSV with player, market/stat, and line columns.")
+                    st.warning("The upload did not contain parseable PrizePicks rows. This usually means the browser export found 0 rows. Try the new v2 browser script, make sure WNBA projections are visible on the PrizePicks page, or upload a CSV with player, market/stat, and line columns.")
                 elif pp_odds.empty:
                     st.warning("PrizePicks rows were parsed, but none matched the current model board. Check the debug table for player-name mismatches.")
                 else:
