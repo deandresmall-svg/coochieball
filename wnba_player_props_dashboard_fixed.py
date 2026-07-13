@@ -1172,13 +1172,34 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
     '[class*="card"]', '[role="button"]', 'button', 'article'
   ].join(', ');
 
+  const rows = [];
+  const seen = new Set();
+  const elements = [];
+  const json_sources = [];
+  const fetch_debug = [];
+
   function marketName(m) {
     const x = (m || "").toLowerCase().replace(/\s+/g, "");
-    if (x === "points" || x === "pts") return "Points";
-    if (x === "rebounds" || x === "rebs") return "Rebounds";
-    if (x === "assists" || x === "asts") return "Assists";
+    if (x === "points" || x === "pts" || x === "point") return "Points";
+    if (x === "rebounds" || x === "rebs" || x === "reb") return "Rebounds";
+    if (x === "assists" || x === "asts" || x === "ast") return "Assists";
     if (x.includes("pts+rebs+asts") || x.includes("points+rebounds+assists") || x.includes("ptsrebsasts") || x === "pra") return "PRA";
     return m;
+  }
+
+  function addRow(row, source) {
+    if (!row) return;
+    const player = norm(row.player || row.player_name || row.name || row.display_name || row.description);
+    const market = marketName(norm(row.market || row.stat || row.stat_type || row.prop_type || row.projection_type || row.category));
+    const line = parseFloat(row.line ?? row.line_score ?? row.value ?? row.over_under ?? row.projection ?? row.target);
+    if (!player || !market || !Number.isFinite(line)) return;
+    if (!["Points", "Rebounds", "Assists", "PRA"].includes(market)) return;
+    const promoText = norm(`${row.promo_type || ""} ${row.type || ""} ${row.odds_type || ""} ${row.name || ""} ${row.description || ""}`).toLowerCase();
+    const promo_type = promoText.includes("goblin") ? "goblin" : promoText.includes("demon") ? "demon" : promoText.includes("discount") ? "discount" : (row.promo_type || "normal");
+    const key = `${player}|${market}|${line}|${promo_type}`.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push({ player, market, line, promo_type, source, raw_text: row.raw_text || "", raw_json: row.raw_json || "" });
   }
 
   function isNameLine(s) {
@@ -1190,8 +1211,12 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
     return /^[A-Za-z .'’\-]+$/.test(x);
   }
 
-  function parseBlock(text) {
+  function parseBlock(text, source="dom") {
     const raw = (text || "").replace(/\r/g, "\n");
+    const compactMatch = raw.match(new RegExp(`([A-Z][A-Za-z .'’\\-]{2,})\\s+(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i"));
+    if (compactMatch) {
+      addRow({ player: compactMatch[1], line: compactMatch[2], market: compactMatch[3], raw_text: raw.slice(0, 1200) }, source);
+    }
     const spaced = raw
       .replace(/\b(More|Less|Goblin|Demon|Discount|Points|Pts|Rebounds|Rebs|Assists|Asts|PRA)\b/g, "\n$1\n")
       .replace(/(\d+(?:\.\d+)?)/g, "\n$1\n");
@@ -1213,92 +1238,216 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
       if (!player) continue;
       const windowText = lines.slice(Math.max(0, i - 10), Math.min(lines.length, i + 10)).join(" ").toLowerCase();
       const promo_type = windowText.includes("goblin") ? "goblin" : windowText.includes("demon") ? "demon" : windowText.includes("discount") ? "discount" : "normal";
-      return { player, market, line, promo_type, raw_text: raw.slice(0, 1200) };
+      addRow({ player, market, line, promo_type, raw_text: raw.slice(0, 1200) }, source);
     }
-    return null;
   }
-
-  const rows = [];
-  const seen = new Set();
-  const elements = [];
-  const addParsed = (parsed) => {
-    if (!parsed) return;
-    const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
-    if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
-  };
 
   function collectVisible(passLabel) {
     const els = [...document.querySelectorAll(selector)];
     for (const [idx, el] of els.entries()) {
       const visible_text = el.innerText || el.textContent || "";
-      const parsed = parseBlock(visible_text);
-      addParsed(parsed);
-      if (elements.length < 400) {
+      parseBlock(visible_text, `visible_${passLabel}`);
+      if (elements.length < 700) {
         elements.push({
           pass: passLabel,
           idx,
           tag: el.tagName,
-          visible_text: visible_text.slice(0, 1500),
+          visible_text: visible_text.slice(0, 1800),
           attributes: Object.fromEntries([...el.attributes].slice(0, 30).map(a => [a.name, a.value]))
         });
       }
     }
   }
 
-  function findScrollTarget() {
-    const candidates = [...document.querySelectorAll('main, [role="main"], [class*="scroll"], [class*="Scroll"], [class*="overflow"], div, section')]
-      .filter(el => el && el.scrollHeight > el.clientHeight + 250)
-      .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-    return candidates[0] || document.scrollingElement || document.documentElement;
+  function getPlayerLookup(root) {
+    const lookup = new Map();
+    const visited = new WeakSet();
+    const visit = (obj) => {
+      if (!obj || typeof obj !== "object") return;
+      if (visited.has(obj)) return;
+      visited.add(obj);
+      if (Array.isArray(obj)) { for (const v of obj) visit(v); return; }
+      const id = obj.id != null ? String(obj.id) : "";
+      const attrs = obj.attributes && typeof obj.attributes === "object" ? obj.attributes : obj;
+      const first = norm(attrs.first_name);
+      const last = norm(attrs.last_name);
+      const nm = norm(attrs.name || attrs.display_name || attrs.full_name || `${first} ${last}`);
+      if (id && nm && !/projection|league|team/i.test(nm)) lookup.set(id, nm);
+      for (const v of Object.values(obj)) visit(v);
+    };
+    visit(root);
+    return lookup;
   }
 
-  const scrollTarget = findScrollTarget();
-  const scrollInfo = {
-    tag: scrollTarget.tagName || "document",
-    className: scrollTarget.className || "",
-    initialScrollHeight: scrollTarget.scrollHeight,
-    initialClientHeight: scrollTarget.clientHeight
-  };
+  function extractRowsFromJSON(root, label) {
+    if (!root || typeof root !== "object") return;
+    const playerLookup = getPlayerLookup(root);
+    const visited = new WeakSet();
+    const visit = (obj) => {
+      if (!obj || typeof obj !== "object") return;
+      if (visited.has(obj)) return;
+      visited.add(obj);
+      if (Array.isArray(obj)) { for (const v of obj) visit(v); return; }
 
-  collectVisible("initial");
+      const attrs = obj.attributes && typeof obj.attributes === "object" ? obj.attributes : obj;
+      const line = attrs.line_score ?? attrs.line ?? attrs.value ?? attrs.over_under ?? attrs.projection ?? attrs.target;
+      const stat = attrs.stat_type ?? attrs.stat ?? attrs.market ?? attrs.prop_type ?? attrs.projection_type ?? attrs.category;
+      let player = attrs.player_name ?? attrs.player ?? attrs.athlete ?? attrs.participant_name ?? attrs.playerName ?? "";
+      const possibleName = attrs.display_name ?? attrs.name ?? attrs.description ?? "";
+      if (!player && possibleName && !["Points", "Rebounds", "Assists", "PRA"].includes(marketName(possibleName))) player = possibleName;
 
-  let lastTop = -1;
-  let stuck = 0;
-  const maxPasses = 90;
-  for (let pass = 1; pass <= maxPasses; pass++) {
-    if (scrollTarget === document.scrollingElement || scrollTarget === document.documentElement || scrollTarget === document.body) {
-      window.scrollBy(0, Math.floor(window.innerHeight * 0.85));
-      await sleep(650);
-      collectVisible(`scroll_${pass}`);
-      const currentTop = window.scrollY;
-      if (Math.abs(currentTop - lastTop) < 5) stuck += 1; else stuck = 0;
-      lastTop = currentTop;
-      const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 20);
-      if (nearBottom || stuck >= 4) break;
-    } else {
-      scrollTarget.scrollTop += Math.floor(scrollTarget.clientHeight * 0.85);
-      await sleep(650);
-      collectVisible(`scroll_${pass}`);
-      const currentTop = scrollTarget.scrollTop;
-      if (Math.abs(currentTop - lastTop) < 5) stuck += 1; else stuck = 0;
-      lastTop = currentTop;
-      const nearBottom = (scrollTarget.scrollTop + scrollTarget.clientHeight) >= (scrollTarget.scrollHeight - 20);
-      if (nearBottom || stuck >= 4) break;
+      if (!player && obj.relationships && typeof obj.relationships === "object") {
+        for (const relKey of ["new_player", "player", "athlete", "participant"]) {
+          const rel = obj.relationships[relKey];
+          const data = rel && rel.data;
+          const id = data && data.id != null ? String(data.id) : "";
+          if (id && playerLookup.has(id)) { player = playerLookup.get(id); break; }
+        }
+      }
+
+      if (player && stat && line != null) {
+        let raw_json = "";
+        try { raw_json = JSON.stringify(obj).slice(0, 1400); } catch {}
+        addRow({
+          player,
+          market: stat,
+          line,
+          promo_type: attrs.promo_type || attrs.odds_type || attrs.type || "normal",
+          raw_json
+        }, `json_${label}`);
+      }
+      for (const v of Object.values(obj)) visit(v);
+    };
+    visit(root);
+  }
+
+  function tryParseJSON(text) {
+    const s = (text || "").trim();
+    if (!s || !/^[{[]/.test(s)) return null;
+    try { return JSON.parse(s); } catch { return null; }
+  }
+
+  function collectPageJSON() {
+    const sources = [];
+    for (const [label, value] of [
+      ["window.__NEXT_DATA__", window.__NEXT_DATA__],
+      ["window.__NUXT__", window.__NUXT__],
+      ["window.__APOLLO_STATE__", window.__APOLLO_STATE__],
+      ["window.__INITIAL_STATE__", window.__INITIAL_STATE__]
+    ]) {
+      if (value) sources.push([label, value]);
+    }
+    for (const [storageName, storage] of [["localStorage", localStorage], ["sessionStorage", sessionStorage]]) {
+      try {
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          const val = storage.getItem(key);
+          if (val && /projection|prize|line_score|stat_type|wnba/i.test(val + " " + key)) {
+            const parsed = tryParseJSON(val);
+            if (parsed) sources.push([`${storageName}:${key}`, parsed]);
+          }
+        }
+      } catch {}
+    }
+    for (const [idx, script] of [...document.scripts].entries()) {
+      const txt = script.textContent || "";
+      if (/line_score|stat_type|new_player|projections|PrizePicks|WNBA/i.test(txt)) {
+        const parsed = tryParseJSON(txt);
+        if (parsed) sources.push([`script_${idx}`, parsed]);
+      }
+    }
+    for (const [label, value] of sources) {
+      json_sources.push(label);
+      extractRowsFromJSON(value, label);
     }
   }
 
+  async function fetchObservedProjectionResources() {
+    const urls = [...new Set(performance.getEntriesByType("resource")
+      .map(e => e.name)
+      .filter(u => /prizepicks|projection|api/i.test(u) && /projection|projections|board|players/i.test(u))
+    )].slice(0, 35);
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, { credentials: "include" });
+        const ct = res.headers.get("content-type") || "";
+        fetch_debug.push({ url, status: res.status, content_type: ct });
+        if (!res.ok || !/json/i.test(ct)) continue;
+        const json = await res.json();
+        extractRowsFromJSON(json, `fetch_${url.slice(0, 80)}`);
+      } catch (err) {
+        fetch_debug.push({ url, error: String(err).slice(0, 250) });
+      }
+    }
+  }
+
+  async function clickLoadMoreButtons() {
+    for (let pass = 0; pass < 12; pass++) {
+      const buttons = [...document.querySelectorAll('button, [role="button"]')]
+        .filter(b => /show more|load more|view more|more projections|see more/i.test(norm(b.innerText || b.textContent)));
+      if (!buttons.length) break;
+      for (const b of buttons) { try { b.click(); await sleep(450); collectVisible(`load_more_${pass}`); } catch {} }
+    }
+  }
+
+  function scrollableContainers() {
+    const all = [...document.querySelectorAll('main, [role="main"], [class*="scroll"], [class*="Scroll"], [class*="overflow"], div, section')]
+      .filter(el => el && el.scrollHeight > el.clientHeight + 150);
+    all.push(document.scrollingElement || document.documentElement);
+    return [...new Set(all)].sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)).slice(0, 10);
+  }
+
+  async function aggressiveScroll() {
+    const containers = scrollableContainers();
+    const scrollInfo = containers.map(el => ({ tag: el.tagName || "document", className: String(el.className || "").slice(0, 120), scrollHeight: el.scrollHeight, clientHeight: el.clientHeight }));
+    for (const [cidx, el] of containers.entries()) {
+      const max = Math.max(0, (el.scrollHeight || document.body.scrollHeight) - (el.clientHeight || window.innerHeight));
+      const step = Math.max(250, Math.floor((el.clientHeight || window.innerHeight) * 0.7));
+      let last = -1, stuck = 0;
+      for (let top = 0, pass = 0; top <= max + step && pass < 120; top += step, pass++) {
+        try {
+          if (el === document.scrollingElement || el === document.documentElement || el === document.body) {
+            window.scrollTo(0, top);
+            window.dispatchEvent(new WheelEvent('wheel', { deltaY: step, bubbles: true }));
+          } else {
+            el.scrollTop = top;
+            el.dispatchEvent(new WheelEvent('wheel', { deltaY: step, bubbles: true }));
+          }
+        } catch {}
+        await sleep(350);
+        collectVisible(`container_${cidx}_scroll_${pass}`);
+        const cur = (el === document.scrollingElement || el === document.documentElement || el === document.body) ? window.scrollY : el.scrollTop;
+        if (Math.abs(cur - last) < 3) stuck += 1; else stuck = 0;
+        last = cur;
+        await clickLoadMoreButtons();
+        if (stuck >= 5) break;
+      }
+      try { if (el.scrollTop != null) el.scrollTop = 0; else window.scrollTo(0, 0); } catch {}
+    }
+    return scrollInfo;
+  }
+
+  collectVisible("initial");
+  collectPageJSON();
+  await fetchObservedProjectionResources();
+  const scroll_info = await aggressiveScroll();
+  collectVisible("final");
+  collectPageJSON();
+  await fetchObservedProjectionResources();
+
   const rawText = document.body.innerText || "";
-  const blocks = rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g);
-  for (const block of blocks) addParsed(parseBlock(block));
+  rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g).forEach(block => parseBlock(block, "body_text"));
 
   const payload = {
     exported_at: new Date().toISOString(),
     page_url: window.location.href,
-    source: "PrizePicks browser export v3 auto-scroll",
+    source: "PrizePicks browser export v4 deep page-data + auto-scroll",
     row_count: rows.length,
     rows,
     elements,
-    scroll_info: scrollInfo,
+    json_sources,
+    fetch_debug,
+    scroll_info,
     raw_text: rawText
   };
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1309,6 +1458,7 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
   document.body.appendChild(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   console.log(`Exported ${rows.length} PrizePicks rows`, rows);
+  console.log("PrizePicks export debug", { json_sources, fetch_debug, scroll_info, elements_sample: elements.slice(0, 5) });
 })();
 '''
 
