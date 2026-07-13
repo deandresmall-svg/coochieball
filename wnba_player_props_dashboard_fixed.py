@@ -838,23 +838,73 @@ def normalize_sgo_market(stat_id: Any, market_name: Any = "", bet_type_id: Any =
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_sportsgameodds_events(api_key: str, slate_date: date) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Fetch WNBA events with odds from SportsGameOdds for the selected slate date."""
+    """Fetch WNBA events from SportsGameOdds for the selected slate date.
+
+    SportsGameOdds can reject some filter combinations with HTTP 400, especially
+    if a plan/feed does not support the exact filtered odds query.  The dashboard
+    now tries the strict odds/date query first, then falls back to simpler event
+    queries and filters the slate locally.  This keeps event lookup from blocking
+    prop fetching; once an EventID is known, props are fetched with eventIDs only.
+    """
     if not api_key:
         return pd.DataFrame(), {}
+
+    # Use a slightly wider UTC window so evening U.S. games and timezone drift do
+    # not get filtered out before we can match the games locally.
     start_dt = datetime.combine(slate_date, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-    end_dt = datetime.combine(slate_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-    params = {
-        "leagueID": "WNBA",
-        "finalized": "false",
-        "oddsAvailable": "true",
-        "startsAfter": start_dt,
-        "startsBefore": end_dt,
-        "limit": 100,
-    }
-    response = _sgo_request(api_key, "/events/", params, timeout=30)
-    payload = response.json()
-    data = payload.get("data", []) or []
+    end_dt = datetime.combine(slate_date + timedelta(days=2), datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    candidate_queries: list[tuple[str, dict[str, Any]]] = [
+        ("strict date + odds", {
+            "leagueID": "WNBA",
+            "oddsAvailable": "true",
+            "startsAfter": start_dt,
+            "startsBefore": end_dt,
+            "limit": 100,
+        }),
+        ("date only", {
+            "leagueID": "WNBA",
+            "startsAfter": start_dt,
+            "startsBefore": end_dt,
+            "limit": 100,
+        }),
+        ("league + odds", {
+            "leagueID": "WNBA",
+            "oddsAvailable": "true",
+            "limit": 100,
+        }),
+        ("league only", {
+            "leagueID": "WNBA",
+            "limit": 100,
+        }),
+    ]
+
+    last_errors: list[str] = []
+    payload: dict[str, Any] = {}
+    data: list[Any] = []
+    used_query = ""
+    used_params: dict[str, Any] = {}
+
+    for label, params in candidate_queries:
+        try:
+            response = _sgo_request(api_key, "/events/", params, timeout=30)
+            payload = response.json()
+            data = payload.get("data", []) or []
+            used_query = label
+            used_params = params
+            break
+        except requests.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.response.text[:300] if exc.response is not None else ""
+            except Exception:
+                body = ""
+            last_errors.append(f"{label}: {type(exc).__name__} {exc} {body}".strip())
+        except requests.RequestException as exc:
+            last_errors.append(f"{label}: {type(exc).__name__} {exc}".strip())
+
     rows: list[dict[str, Any]] = []
+    wanted_dates = {slate_date, slate_date + timedelta(days=1)}
     for event in data:
         if not isinstance(event, dict):
             continue
@@ -865,11 +915,23 @@ def fetch_sportsgameodds_events(api_key: str, slate_date: date) -> tuple[pd.Data
         if home not in TEAM_NAMES or away not in TEAM_NAMES or not event_id:
             continue
         status = event.get("status", {}) if isinstance(event.get("status", {}), dict) else {}
+        starts_at_raw = str(status.get("startsAt") or "")
+        event_date = slate_date
+        if starts_at_raw:
+            try:
+                parsed_start = pd.to_datetime(starts_at_raw, utc=True, errors="coerce")
+                if pd.notna(parsed_start):
+                    event_date = parsed_start.date()
+            except Exception:
+                event_date = slate_date
+        # If we had to fall back to broad league queries, keep only slate-window games.
+        if "startsAfter" not in used_params and event_date not in wanted_dates:
+            continue
         rows.append({
             "SportsGameOddsEventID": str(event_id),
             "EventID": str(event_id),
-            "GameDate": slate_date,
-            "GameTimeUTC": str(status.get("startsAt") or ""),
+            "GameDate": event_date,
+            "GameTimeUTC": starts_at_raw,
             "Away": away,
             "Home": home,
             "Game": f"{away} @ {home}",
@@ -879,15 +941,18 @@ def fetch_sportsgameodds_events(api_key: str, slate_date: date) -> tuple[pd.Data
                 if isinstance(odd, dict) and str(odd.get("statEntityID") or "") not in ["all", "home", "away", ""]
             ),
         })
+
     frame = pd.DataFrame(rows).drop_duplicates(["SportsGameOddsEventID"]) if rows else pd.DataFrame()
     meta = {
         "provider": "SportsGameOdds",
         "endpoint": "/events/",
+        "query_used": used_query or "none",
         "objects": str(len(data)),
-        "nextCursor": str(payload.get("nextCursor", "") or ""),
+        "events_matched": str(len(frame)),
+        "nextCursor": str(payload.get("nextCursor", "") or "") if isinstance(payload, dict) else "",
+        "fallback_errors": " | ".join(last_errors[:3]),
     }
     return frame, meta
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_sportsgameodds_event_props(
