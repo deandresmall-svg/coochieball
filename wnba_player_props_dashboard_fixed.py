@@ -8,7 +8,7 @@ Primary data source: official WNBA Stats endpoints (LeagueID 10).
 Optional market source: SportsGameOdds WNBA API.
 
 Install:
-    pip install streamlit pandas numpy requests
+    pip install streamlit pandas numpy requests pillow pytesseract
 Run:
     streamlit run wnba_player_props_dashboard.py
 """
@@ -1696,34 +1696,107 @@ def parse_prizepicks_payload(payload: Any) -> pd.DataFrame:
     return out.drop_duplicates(["NameKey", "Market", "Line", "PromoType"], keep="last")
 
 
+def _is_image_upload_name(name: str) -> bool:
+    return str(name or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"))
+
+
+def _ocr_prizepicks_image(raw_bytes: bytes) -> str:
+    """Extract text from a PrizePicks screenshot. Requires pytesseract + tesseract binary.
+
+    Streamlit Cloud note: add `pytesseract` and `Pillow` to requirements.txt and
+    `tesseract-ocr` to packages.txt if OCR is not already available.
+    """
+    try:
+        from PIL import Image, ImageEnhance, ImageOps
+        import pytesseract
+    except Exception as exc:
+        raise RuntimeError(
+            "Screenshot OCR needs pytesseract + Pillow. Add pytesseract/Pillow to requirements.txt "
+            "and tesseract-ocr to packages.txt, or use CSV/text paste import."
+        ) from exc
+
+    image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    width, height = image.size
+    # Upscale small tablet/phone screenshots so card text is easier to read.
+    scale = 2 if max(width, height) < 2200 else 1
+    if scale > 1:
+        image = image.resize((width * scale, height * scale))
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+    gray = ImageEnhance.Contrast(gray).enhance(1.35)
+    gray = ImageEnhance.Sharpness(gray).enhance(1.5)
+
+    configs = ["--psm 6", "--psm 11"]
+    texts: list[str] = []
+    for cfg in configs:
+        try:
+            txt = pytesseract.image_to_string(gray, config=cfg)
+            if txt:
+                texts.append(txt)
+        except Exception:
+            continue
+    return "\n".join(texts)
+
+
+def _parse_prizepicks_plain_text(text: str) -> pd.DataFrame:
+    rows = _parse_prizepicks_text_rows(text)
+    if rows:
+        return parse_prizepicks_payload(rows)
+
+    # Extra loose fallback for pasted/OCR text in one-line card formats:
+    #   Player Name 22.5 Points Goblin
+    #   Player Name Points 22.5
+    market_terms = r"Points|Pts|Rebounds|Rebs|Assists|Asts|Pts\s*\+\s*Rebs\s*\+\s*Asts|PRA"
+    loose_rows: list[dict[str, Any]] = []
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        match = re.search(rf"(?P<player>[A-Za-z .'’\-]{{3,55}}?)\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<market>{market_terms})\b", line, flags=re.I)
+        if not match:
+            match = re.search(rf"(?P<player>[A-Za-z .'’\-]{{3,55}}?)\s+(?P<market>{market_terms})\b\s*(?P<val>\d+(?:\.\d+)?)", line, flags=re.I)
+        if not match:
+            continue
+        player = re.sub(r"\b(More|Less|Goblin|Demon|Discount|WNBA)\b", "", match.group("player"), flags=re.I).strip(" -|")
+        if not _is_probable_player_name(player):
+            continue
+        promo = "goblin" if "goblin" in line.lower() else "demon" if "demon" in line.lower() else "discount" if "discount" in line.lower() else "normal"
+        loose_rows.append({"player": player, "market": match.group("market"), "line": match.group("val"), "promo_type": promo, "raw_text": line})
+    return parse_prizepicks_payload(loose_rows)
+
+
 def parse_prizepicks_upload(uploaded: Any) -> pd.DataFrame:
     if uploaded is None:
         return pd.DataFrame()
     name = getattr(uploaded, "name", "").lower()
     raw_bytes = uploaded.getvalue()
+
     if name.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(raw_bytes))
-        return parse_prizepicks_payload(df.to_dict("records"))
+        parsed = parse_prizepicks_payload(df.to_dict("records"))
+        if not parsed.empty:
+            parsed["SourceFile"] = getattr(uploaded, "name", "")
+        return parsed
+
+    if _is_image_upload_name(name):
+        ocr_text = _ocr_prizepicks_image(raw_bytes)
+        parsed = _parse_prizepicks_plain_text(ocr_text)
+        if not parsed.empty:
+            parsed["SourceFile"] = getattr(uploaded, "name", "")
+            parsed["OCR_Text"] = ocr_text[:2500]
+        return parsed
+
     text = raw_bytes.decode("utf-8-sig", errors="ignore")
     if name.endswith(".json") or text.strip().startswith(("{", "[")):
-        return parse_prizepicks_payload(json.loads(text))
-    rows: list[dict[str, Any]] = []
-    blocks = re.split(r"\n\s*\n|(?=\b[A-Z][A-Za-z .'’-]+\b\s*\n)", text)
-    pattern = re.compile(r"(?P<line>\d+(?:\.\d+)?)\s*(?P<market>Points|Pts|Rebounds|Rebs|Assists|Asts|Pts\s*\+\s*Rebs\s*\+\s*Asts|PRA)\b", re.I)
-    for block in blocks:
-        match = pattern.search(block)
-        if not match:
-            continue
-        lines = [x.strip() for x in block.splitlines() if x.strip()]
-        player = ""
-        idx = next((i for i, line in enumerate(lines) if pattern.search(line)), 0)
-        for candidate in reversed(lines[max(0, idx - 4):idx]):
-            if re.match(r"^[A-Za-z .'’-]{3,}$", candidate):
-                player = candidate
-                break
-        if player:
-            rows.append({"player": player, "market": match.group("market"), "line": match.group("line"), "promo_type": _prizepicks_promo_type({"text": block})})
-    return parse_prizepicks_payload(rows)
+        parsed = parse_prizepicks_payload(json.loads(text))
+        if not parsed.empty:
+            parsed["SourceFile"] = getattr(uploaded, "name", "")
+        return parsed
+
+    parsed = _parse_prizepicks_plain_text(text)
+    if not parsed.empty:
+        parsed["SourceFile"] = getattr(uploaded, "name", "")
+    return parsed
 
 
 def _name_similarity(a: str, b: str) -> float:
@@ -2518,22 +2591,34 @@ if board.empty:
     st.stop()
 
 # Fetch/import props after board exists
-with st.expander("PrizePicks line import — recommended", expanded=False):
+with st.expander("PrizePicks line import — screenshot/CSV workflow", expanded=False):
     st.markdown(
         """
-        Use this when SportsGameOdds/odds APIs are stale or missing PrizePicks. Build the WNBA board first,
-        export PrizePicks lines once, upload the file here, and the dashboard will match the lines to the players.
+        Use this when APIs are stale or missing PrizePicks. No browser console or auto-scroll scripts are needed.
+        Upload PrizePicks screenshots, CSV files, or pasted-text TXT files and the dashboard will OCR/parse the lines,
+        then match them to the current WNBA board.
         """
     )
-    st.caption("Best workflow: open PrizePicks WNBA projections, filter to Points/Rebounds/Assists/PRA, run the browser script below, then upload the downloaded JSON here.")
-    with st.expander("Browser export script", expanded=False):
-        st.code(PRIZEPICKS_EXPORT_SCRIPT, language="javascript")
-        st.caption("Paste this in your browser console while on PrizePicks. It downloads a JSON file with the visible WNBA projection cards. If your browser blocks console pasting, type allow pasting first.")
-    pp_upload = st.file_uploader(
-        "Upload PrizePicks export or CSV",
-        type=["json", "csv", "txt"],
-        key="wnba_prizepicks_upload",
-        help="Supports the browser-export JSON above or a CSV with player/stat/line columns.",
+    st.info(
+        "Screenshot workflow: filter PrizePicks to WNBA, open one market at a time (Points, Rebounds, Assists, or PRA), "
+        "take screenshots while you manually scroll, then upload all screenshots here. Avoid developer tools to prevent account restrictions."
+    )
+    with st.expander("Screenshot tips", expanded=False):
+        st.markdown(
+            """
+            - Capture the player name, stat type, and line in the same screenshot.
+            - Use one market filter at a time when possible.
+            - Slight overlap between screenshots is fine; duplicates are removed.
+            - Goblin/Demon text is detected when visible.
+            - If OCR misses a few rows, upload a small CSV/TXT correction for just those rows.
+            """
+        )
+    pp_uploads = st.file_uploader(
+        "Upload PrizePicks screenshots / CSV / TXT / JSON",
+        type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "csv", "txt", "json"],
+        key="wnba_prizepicks_uploads",
+        accept_multiple_files=True,
+        help="Supports screenshots plus CSV/TXT/JSON. CSV/TXT can use player, market/stat, line, and promo_type columns/fields.",
     )
     col_pp_1, col_pp_2 = st.columns([1, 1])
     with col_pp_1:
@@ -2548,11 +2633,20 @@ with st.expander("PrizePicks line import — recommended", expanded=False):
             st.session_state["wnba_odds"] = current_odds[~current_odds["BookmakerKey"].astype(str).str.lower().eq("prizepicks")].copy()
         st.rerun()
     if import_pp:
-        if pp_upload is None:
-            st.warning("Upload a PrizePicks JSON/CSV/TXT export first.")
+        if not pp_uploads:
+            st.warning("Upload at least one PrizePicks screenshot, CSV, TXT, or JSON file first.")
         else:
             try:
-                pp_rows = parse_prizepicks_upload(pp_upload)
+                parsed_frames: list[pd.DataFrame] = []
+                for uploaded_file in pp_uploads:
+                    frame = parse_prizepicks_upload(uploaded_file)
+                    if isinstance(frame, pd.DataFrame) and not frame.empty:
+                        parsed_frames.append(frame)
+                pp_rows = pd.concat(parsed_frames, ignore_index=True) if parsed_frames else pd.DataFrame()
+                if not pp_rows.empty:
+                    dedupe_cols = [c for c in ["NameKey", "Market", "Line", "PromoType"] if c in pp_rows.columns]
+                    if dedupe_cols:
+                        pp_rows = pp_rows.drop_duplicates(dedupe_cols, keep="last")
                 pp_odds, pp_debug = prizepicks_rows_to_odds_frame(pp_rows, board)
                 st.session_state["wnba_prizepicks_rows"] = pp_rows
                 st.session_state["wnba_prizepicks_debug"] = pp_debug
@@ -2563,14 +2657,14 @@ with st.expander("PrizePicks line import — recommended", expanded=False):
                     existing_odds = pd.DataFrame()
                 st.session_state["wnba_odds"] = combine_odds_frames([existing_odds, pp_odds])
                 if pp_rows.empty:
-                    st.warning("The upload did not contain parseable PrizePicks rows. This usually means the browser export found 0 rows. Try the new v2 browser script, make sure WNBA projections are visible on the PrizePicks page, or upload a CSV with player, market/stat, and line columns.")
+                    st.warning("No parseable PrizePicks rows were found. Try a closer screenshot with player name + line + stat visible, or upload a TXT/CSV correction.")
                 elif pp_odds.empty:
                     st.warning("PrizePicks rows were parsed, but none matched the current model board. Check the debug table for player-name mismatches.")
                 else:
                     st.success(f"Imported {len(pp_rows):,} PrizePicks rows and matched {len(pp_odds) // 2:,} player-market lines.")
                 st.rerun()
             except Exception as exc:
-                st.error(f"PrizePicks import failed: {type(exc).__name__}: {exc}")
+                st.error(f"PrizePicks screenshot/import failed: {type(exc).__name__}: {exc}")
     pp_rows_display = st.session_state.get("wnba_prizepicks_rows", pd.DataFrame())
     if isinstance(pp_rows_display, pd.DataFrame) and not pp_rows_display.empty:
         st.caption("Parsed PrizePicks rows")
