@@ -1054,8 +1054,12 @@ def fetch_sportsgameodds_event_props(
         "includeOpposingOdds": "true",
         "includeAltLines": "true" if include_alt_lines else "false",
     }
-    if bookmaker_ids:
-        params["bookmakerID"] = ",".join(bookmaker_ids)
+    # Important: some SportsGameOdds plans/endpoints can return HTTP 400 when
+    # bookmakerID is combined with eventIDs for DFS providers such as PrizePicks.
+    # Fetch the full event odds payload, then filter to the chosen line source
+    # locally in choose_market_quote(). This keeps PrizePicks-only mode from
+    # crashing and still leaves columns blank if PrizePicks is not returned.
+    requested_bookmakers = tuple(str(x).strip().lower() for x in bookmaker_ids if str(x).strip())
     response = _sgo_request(api_key, "/events/", params, timeout=35)
     payload = response.json()
     events = payload.get("data", []) or []
@@ -1124,10 +1128,13 @@ def fetch_sportsgameodds_event_props(
     meta = {
         "provider": "SportsGameOdds",
         "endpoint": "/events/",
+        "bookmaker_filter_sent_to_api": "no",
+        "requested_local_bookmakers": ",".join(requested_bookmakers),
         "raw_events": str(len(events)),
         "raw_odds": str(seen_odd_count),
         "player_prop_odds": str(player_prop_odd_count),
         "parsed_quote_rows": str(len(rows)),
+        "returned_bookmakers": ", ".join(sorted(set(str(x) for x in pd.DataFrame(rows).get("BookmakerKey", pd.Series(dtype=str)).dropna().astype(str)))[:20]) if rows else "",
         "raw_markets": ", ".join(sorted(x for x in raw_market_labels if x)[:12]),
     }
     return pd.DataFrame(rows), meta
@@ -1773,7 +1780,7 @@ with st.sidebar:
     sgo_bookmakers_text = st.text_input(
         "Optional SportsGameOdds bookmaker IDs",
         value="",
-        help="Comma-separated IDs like prizepicks,hardrockbet,fanduel,draftkings. Leave blank and the selected Line source will be used when possible.",
+        help="Comma-separated IDs like prizepicks,hardrockbet,fanduel,draftkings. The dashboard now filters locally instead of sending bookmakerID to SportsGameOdds, which avoids 400 errors with DFS providers.",
     )
 
     if st.button("Clear cached data", width="stretch"):
@@ -1874,7 +1881,7 @@ with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
     include_alt_lines = st.checkbox("Include alt lines", value=False, help="Usually leave this off for main prop-line comparison. Turn on if you want alternate lines included in the raw quotes.")
     st.caption("SportsGameOdds uses the /v2/events endpoint. Player props are inside each event's odds object; statEntityID identifies the player, statID identifies the stat, and each bookmaker quote carries the line in overUnder.")
     if odds_source_mode != "Consensus":
-        st.info(f"Line source is set to {odds_source_mode}. Fetches will request that provider when SportsGameOdds supports its bookmaker ID, and the board will ignore other providers for line/edge columns.")
+        st.info(f"Line source is set to {odds_source_mode}. The app fetches the full event odds payload and filters locally, so PrizePicks-only mode will not cause a SportsGameOdds 400 error. If PrizePicks is not in the returned payload, line columns remain blank.")
 
     if sgo_api_key:
         if st.button("Find SportsGameOdds WNBA event IDs", width="stretch"):
@@ -2245,3 +2252,4 @@ with notes_tab:
         Data sources: official WNBA Stats for completed game logs; official WNBA schedule/injury pages when available; SportsGameOdds WNBA API for optional prop lines.
         """
     )
+
