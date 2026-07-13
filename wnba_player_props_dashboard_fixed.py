@@ -1149,6 +1149,268 @@ def combine_odds_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     )
 
 
+# -----------------------------------------------------------------------------
+# PrizePicks upload/import helpers
+# -----------------------------------------------------------------------------
+
+PRIZEPICKS_EXPORT_SCRIPT = r'''
+(() => {
+  const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const rawText = document.body.innerText || "";
+  const candidates = [...document.querySelectorAll(
+    '[data-testid*="projection"], [data-projection-id], [data-projectionid], [class*="projection"], [class*="Projection"], [class*="card"], button, article'
+  )];
+  const markets = ["Points", "Pts", "Rebounds", "Rebs", "Assists", "Asts", "Pts+Rebs+Asts", "Pts + Rebs + Asts", "PRA"];
+  const marketRegex = new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${markets.map(x => x.replace(/[+]/g, "\\+")).join("|")})`, "i");
+  function marketName(m) {
+    const x = (m || "").toLowerCase().replace(/\s+/g, "");
+    if (x === "points" || x === "pts") return "Points";
+    if (x === "rebounds" || x === "rebs") return "Rebounds";
+    if (x === "assists" || x === "asts") return "Assists";
+    if (x.includes("pts+rebs+asts") || x === "pra") return "PRA";
+    return m;
+  }
+  function parseBlock(text) {
+    text = (text || "").replace(/\r/g, "\n");
+    const match = text.match(marketRegex);
+    if (!match) return null;
+    const line = parseFloat(match[1]);
+    const market = marketName(match[2]);
+    const lines = text.split("\n").map(norm).filter(Boolean);
+    const marketIndex = lines.findIndex(l => marketRegex.test(l));
+    let player = "";
+    for (let i = Math.max(0, marketIndex - 4); i < marketIndex; i++) {
+      const cand = lines[i] || "";
+      if (/^[A-Za-z .'’-]{3,}$/.test(cand) && !/^(WNBA|More|Less|Goblin|Demon|Discount)$/i.test(cand)) player = cand;
+    }
+    if (!player) {
+      const before = text.slice(0, match.index).split("\n").map(norm).filter(Boolean);
+      player = before.reverse().find(x => /^[A-Za-z .'’-]{3,}$/.test(x)) || "";
+    }
+    const lower = text.toLowerCase();
+    const promo_type = lower.includes("goblin") ? "goblin" : lower.includes("demon") ? "demon" : lower.includes("discount") ? "discount" : "normal";
+    if (!player || !Number.isFinite(line)) return null;
+    return { player, market, line, promo_type, raw_text: text.slice(0, 1000) };
+  }
+  const rows = [];
+  const seen = new Set();
+  for (const el of candidates) {
+    const txt = norm(el.innerText || el.textContent || "");
+    if (!txt || txt.length < 12 || txt.length > 1500) continue;
+    const parsed = parseBlock(txt.replace(/ More /g, "\nMore\n").replace(/ Less /g, "\nLess\n"));
+    if (!parsed) continue;
+    const key = `${parsed.player}|${parsed.market}|${parsed.line}|${parsed.promo_type}`.toLowerCase();
+    if (!seen.has(key)) { seen.add(key); rows.push(parsed); }
+  }
+  const payload = { exported_at: new Date().toISOString(), page_url: window.location.href, source: "PrizePicks browser export", rows, raw_text: rawText };
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `prizepicks_wnba_export_${stamp}.json`;
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  console.log(`Exported ${rows.length} PrizePicks rows`, rows);
+})();
+'''
+
+
+def _string_or_blank(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    return str(value).strip()
+
+
+def _first_present(mapping: dict[str, Any], keys: Iterable[str]) -> Any:
+    lower_map = {str(k).lower().replace(" ", "_"): v for k, v in mapping.items()}
+    for key in keys:
+        key_norm = key.lower().replace(" ", "_")
+        if key_norm in lower_map and _string_or_blank(lower_map[key_norm]):
+            return lower_map[key_norm]
+    return None
+
+
+def prizepicks_market_to_dashboard(value: Any) -> str:
+    text = normalize_text(value).replace(" ", "")
+    if text in {"POINT", "POINTS", "PTS", "PLAYERPOINTS"}:
+        return "player_points"
+    if text in {"REBOUND", "REBOUNDS", "REB", "REBS", "PLAYERREBOUNDS"}:
+        return "player_rebounds"
+    if text in {"ASSIST", "ASSISTS", "AST", "ASTS", "PLAYERASSISTS"}:
+        return "player_assists"
+    if text in {"PRA", "PTSREBSASTS", "PTS+REBS+ASTS", "POINTSREBOUNDSASSISTS", "PLAYERPOINTSREBOUNDSASSISTS"}:
+        return "player_points_rebounds_assists"
+    if "REBOUND" in text and "ASSIST" in text and ("POINT" in text or "PTS" in text):
+        return "player_points_rebounds_assists"
+    if "POINT" in text or text == "PTS":
+        return "player_points"
+    if "REBOUND" in text or text in {"REB", "REBS"}:
+        return "player_rebounds"
+    if "ASSIST" in text or text in {"AST", "ASTS"}:
+        return "player_assists"
+    return ""
+
+
+def _prizepicks_promo_type(row: dict[str, Any]) -> str:
+    joined = " ".join(_string_or_blank(v) for v in row.values()).lower()
+    if "goblin" in joined:
+        return "goblin"
+    if "demon" in joined:
+        return "demon"
+    if "discount" in joined or "promo" in joined:
+        return "discount"
+    return _string_or_blank(_first_present(row, ["promo_type", "projection_type", "type", "line_type"])) or "normal"
+
+
+def _flatten_json_dicts(obj: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(obj, dict):
+        found.append(obj)
+        for value in obj.values():
+            found.extend(_flatten_json_dicts(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_flatten_json_dicts(item))
+    return found
+
+
+def _player_lookup_from_prizepicks_json(payload: Any) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    if not isinstance(payload, dict):
+        return lookup
+    included = payload.get("included") or []
+    if not isinstance(included, list):
+        return lookup
+    for item in included:
+        if not isinstance(item, dict):
+            continue
+        item_id = _string_or_blank(item.get("id"))
+        attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
+        first = _string_or_blank(attrs.get("first_name"))
+        last = _string_or_blank(attrs.get("last_name"))
+        name = _string_or_blank(attrs.get("name") or attrs.get("display_name") or attrs.get("full_name") or f"{first} {last}".strip())
+        if item_id and name:
+            lookup[item_id] = name
+    return lookup
+
+
+def parse_prizepicks_payload(payload: Any) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    player_lookup = _player_lookup_from_prizepicks_json(payload)
+    if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        for raw in payload.get("rows", []):
+            if isinstance(raw, dict):
+                rows.append(raw)
+    for item in _flatten_json_dicts(payload):
+        attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else item
+        if not isinstance(attrs, dict):
+            continue
+        line = _first_present(attrs, ["line_score", "line", "value", "over_under", "projection", "target", "score"])
+        stat = _first_present(attrs, ["stat_type", "stat", "market", "prop_type", "projection_type", "category"])
+        player = _first_present(attrs, ["player_name", "player", "name", "athlete", "display_name", "participant_name"])
+        if not player and isinstance(item.get("relationships"), dict):
+            rel = item.get("relationships") or {}
+            for rel_key in ["new_player", "player", "athlete"]:
+                rel_obj = rel.get(rel_key)
+                rel_data = rel_obj.get("data") if isinstance(rel_obj, dict) else None
+                if isinstance(rel_data, dict):
+                    player = player_lookup.get(_string_or_blank(rel_data.get("id")), "")
+                    if player:
+                        break
+        if player and stat and line is not None:
+            rows.append({"player": player, "market": stat, "line": line, "promo_type": _prizepicks_promo_type(attrs), "raw_json": json.dumps(item, default=str)[:1000]})
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["Player", "NameKey", "Market", "Line", "PromoType"])
+    colmap = {str(c).lower().replace(" ", "_"): c for c in frame.columns}
+    def col(*names: str) -> str | None:
+        for name in names:
+            key = name.lower().replace(" ", "_")
+            if key in colmap:
+                return colmap[key]
+        return None
+    player_col = col("player", "player_name", "name", "athlete", "participant", "display_name")
+    market_col = col("market", "stat", "stat_type", "prop_type", "projection_type", "category")
+    line_col = col("line", "line_score", "value", "over_under", "projection", "target")
+    promo_col = col("promo_type", "type", "line_type", "discount_type")
+    team_col = col("team", "team_abbr", "team_name")
+    if not player_col or not market_col or not line_col:
+        return pd.DataFrame(columns=["Player", "NameKey", "Market", "Line", "PromoType"])
+    out = pd.DataFrame({
+        "Player": frame[player_col].map(_string_or_blank),
+        "MarketRaw": frame[market_col].map(_string_or_blank),
+        "Line": pd.to_numeric(frame[line_col], errors="coerce"),
+        "PromoType": frame[promo_col].map(_string_or_blank) if promo_col else "normal",
+        "TeamRaw": frame[team_col].map(_string_or_blank) if team_col else "",
+    })
+    out["Market"] = out["MarketRaw"].map(prizepicks_market_to_dashboard)
+    out["NameKey"] = out["Player"].map(normalize_player_name)
+    out["PromoType"] = out["PromoType"].replace("", "normal")
+    out = out[out["NameKey"].ne("") & out["Market"].ne("") & out["Line"].notna()].copy()
+    return out.drop_duplicates(["NameKey", "Market", "Line", "PromoType"], keep="last")
+
+
+def parse_prizepicks_upload(uploaded: Any) -> pd.DataFrame:
+    if uploaded is None:
+        return pd.DataFrame()
+    name = getattr(uploaded, "name", "").lower()
+    raw_bytes = uploaded.getvalue()
+    if name.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(raw_bytes))
+        return parse_prizepicks_payload(df.to_dict("records"))
+    text = raw_bytes.decode("utf-8-sig", errors="ignore")
+    if name.endswith(".json") or text.strip().startswith(("{", "[")):
+        return parse_prizepicks_payload(json.loads(text))
+    rows: list[dict[str, Any]] = []
+    blocks = re.split(r"\n\s*\n|(?=\b[A-Z][A-Za-z .'’-]+\b\s*\n)", text)
+    pattern = re.compile(r"(?P<line>\d+(?:\.\d+)?)\s*(?P<market>Points|Pts|Rebounds|Rebs|Assists|Asts|Pts\s*\+\s*Rebs\s*\+\s*Asts|PRA)\b", re.I)
+    for block in blocks:
+        match = pattern.search(block)
+        if not match:
+            continue
+        lines = [x.strip() for x in block.splitlines() if x.strip()]
+        player = ""
+        idx = next((i for i, line in enumerate(lines) if pattern.search(line)), 0)
+        for candidate in reversed(lines[max(0, idx - 4):idx]):
+            if re.match(r"^[A-Za-z .'’-]{3,}$", candidate):
+                player = candidate
+                break
+        if player:
+            rows.append({"player": player, "market": match.group("market"), "line": match.group("line"), "promo_type": _prizepicks_promo_type({"text": block})})
+    return parse_prizepicks_payload(rows)
+
+
+def prizepicks_rows_to_odds_frame(pp_rows: pd.DataFrame, board: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if pp_rows is None or pp_rows.empty or board is None or board.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    debug_rows: list[dict[str, Any]] = []
+    board_lookup = board.copy()
+    board_lookup["NameKey"] = board_lookup["NameKey"].fillna(board_lookup["Player"].map(normalize_player_name))
+    for _, pp in pp_rows.iterrows():
+        matches = board_lookup[board_lookup["NameKey"].eq(str(pp["NameKey"]))].copy()
+        team_raw = normalize_team(pp.get("TeamRaw", "")) if "TeamRaw" in pp_rows.columns else ""
+        if team_raw and "Team" in matches.columns:
+            team_matches = matches[matches["Team"].map(normalize_team).eq(team_raw)]
+            if not team_matches.empty:
+                matches = team_matches
+        debug_rows.append({"Player": pp.get("Player"), "Market": pp.get("MarketRaw", pp.get("Market")), "Line": pp.get("Line"), "PromoType": pp.get("PromoType", "normal"), "MatchedBoardRows": int(len(matches))})
+        for _, match in matches.iterrows():
+            for side in ["over", "under"]:
+                rows.append({
+                    "EventID": str(match["EventID"]), "Game": match.get("Game", ""), "NameKey": str(pp["NameKey"]),
+                    "Player": pp.get("Player", match.get("Player", "")), "Team": match.get("Team", ""),
+                    "Market": pp["Market"], "Bookmaker": "PrizePicks", "BookmakerKey": "prizepicks",
+                    "Side": side, "Line": float(pp["Line"]), "Odds": np.nan, "Updated": "",
+                    "MarketType": str(pp.get("PromoType", "normal")), "Source": "PrizePicks upload",
+                    "OddID": f"pp-upload-{match.get('EventID', '')}-{pp['NameKey']}-{pp['Market']}-{side}",
+                })
+    odds = pd.DataFrame(rows).drop_duplicates(["EventID", "BookmakerKey", "Market", "NameKey", "Side", "Line"], keep="last") if rows else pd.DataFrame()
+    return odds, pd.DataFrame(debug_rows)
+
+
 def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]:
     if group.empty:
         return {}
@@ -1873,7 +2135,69 @@ if board.empty:
     st.info("Load the slate and press **Build WNBA player board**.")
     st.stop()
 
-# Fetch props after board exists
+# Fetch/import props after board exists
+with st.expander("PrizePicks line import — recommended", expanded=False):
+    st.markdown(
+        """
+        Use this when SportsGameOdds/odds APIs are stale or missing PrizePicks. Build the WNBA board first,
+        export PrizePicks lines once, upload the file here, and the dashboard will match the lines to the players.
+        """
+    )
+    st.caption("Best workflow: open PrizePicks WNBA projections, filter to Points/Rebounds/Assists/PRA, run the browser script below, then upload the downloaded JSON here.")
+    with st.expander("Browser export script", expanded=False):
+        st.code(PRIZEPICKS_EXPORT_SCRIPT, language="javascript")
+        st.caption("Paste this in your browser console while on PrizePicks. It downloads a JSON file with the visible WNBA projection cards. If your browser blocks console pasting, type allow pasting first.")
+    pp_upload = st.file_uploader(
+        "Upload PrizePicks export or CSV",
+        type=["json", "csv", "txt"],
+        key="wnba_prizepicks_upload",
+        help="Supports the browser-export JSON above or a CSV with player/stat/line columns.",
+    )
+    col_pp_1, col_pp_2 = st.columns([1, 1])
+    with col_pp_1:
+        import_pp = st.button("Import PrizePicks lines", width="stretch")
+    with col_pp_2:
+        clear_pp = st.button("Clear imported PrizePicks lines", width="stretch")
+    if clear_pp:
+        st.session_state.pop("wnba_prizepicks_rows", None)
+        st.session_state.pop("wnba_prizepicks_debug", None)
+        current_odds = st.session_state.get("wnba_odds", pd.DataFrame())
+        if isinstance(current_odds, pd.DataFrame) and not current_odds.empty and "BookmakerKey" in current_odds.columns:
+            st.session_state["wnba_odds"] = current_odds[~current_odds["BookmakerKey"].astype(str).str.lower().eq("prizepicks")].copy()
+        st.rerun()
+    if import_pp:
+        if pp_upload is None:
+            st.warning("Upload a PrizePicks JSON/CSV/TXT export first.")
+        else:
+            try:
+                pp_rows = parse_prizepicks_upload(pp_upload)
+                pp_odds, pp_debug = prizepicks_rows_to_odds_frame(pp_rows, board)
+                st.session_state["wnba_prizepicks_rows"] = pp_rows
+                st.session_state["wnba_prizepicks_debug"] = pp_debug
+                existing_odds = st.session_state.get("wnba_odds", pd.DataFrame())
+                if isinstance(existing_odds, pd.DataFrame) and not existing_odds.empty and "BookmakerKey" in existing_odds.columns:
+                    existing_odds = existing_odds[~existing_odds["BookmakerKey"].astype(str).str.lower().eq("prizepicks")].copy()
+                else:
+                    existing_odds = pd.DataFrame()
+                st.session_state["wnba_odds"] = combine_odds_frames([existing_odds, pp_odds])
+                if pp_rows.empty:
+                    st.warning("The upload did not contain parseable PrizePicks rows. Try the browser script export or a CSV with player, market/stat, and line columns.")
+                elif pp_odds.empty:
+                    st.warning("PrizePicks rows were parsed, but none matched the current model board. Check the debug table for player-name mismatches.")
+                else:
+                    st.success(f"Imported {len(pp_rows):,} PrizePicks rows and matched {len(pp_odds) // 2:,} player-market lines.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"PrizePicks import failed: {type(exc).__name__}: {exc}")
+    pp_rows_display = st.session_state.get("wnba_prizepicks_rows", pd.DataFrame())
+    if isinstance(pp_rows_display, pd.DataFrame) and not pp_rows_display.empty:
+        st.caption("Parsed PrizePicks rows")
+        st.dataframe(pp_rows_display[[c for c in ["Player", "MarketRaw", "Line", "PromoType"] if c in pp_rows_display.columns]].head(200), hide_index=True, width="stretch")
+    pp_debug_display = st.session_state.get("wnba_prizepicks_debug", pd.DataFrame())
+    if isinstance(pp_debug_display, pd.DataFrame) and not pp_debug_display.empty:
+        with st.expander("PrizePicks match debug", expanded=False):
+            st.dataframe(pp_debug_display, hide_index=True, width="stretch")
+
 with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
     market_options = {target: config["market"] for target, config in TARGETS.items()}
     selected_markets = st.multiselect("Markets", list(market_options), default=list(market_options))
@@ -2252,4 +2576,3 @@ with notes_tab:
         Data sources: official WNBA Stats for completed game logs; official WNBA schedule/injury pages when available; SportsGameOdds WNBA API for optional prop lines.
         """
     )
-
