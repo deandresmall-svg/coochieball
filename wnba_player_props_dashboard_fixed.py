@@ -5,7 +5,7 @@ WNBA Player Props Lab
 
 A standalone Streamlit dashboard for WNBA points, rebounds, assists and PRA.
 Primary data source: official WNBA Stats endpoints (LeagueID 10).
-Optional market source: BallDontLie WNBA API.
+Optional market source: SportsGameOdds WNBA API.
 
 Install:
     pip install streamlit pandas numpy requests
@@ -40,8 +40,7 @@ WNBA_STATS_BASE = "https://stats.wnba.com/stats"
 WNBA_STATS_BASES = ["https://stats.wnba.com/stats", "https://stats.nba.com/stats"]
 ESPN_WNBA_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
 EASTERN_TZ = ZoneInfo("America/New_York")
-BALLDONTLIE_API_BASE = "https://api.balldontlie.io"
-BALLDONTLIE_WNBA_BASE = f"{BALLDONTLIE_API_BASE}/wnba/v1"
+SPORTSGAMEODDS_API_BASE = "https://api.sportsgameodds.com/v2"
 
 TARGETS: dict[str, dict[str, str]] = {
     "Points": {
@@ -744,17 +743,15 @@ def fetch_official_schedule(slate_date: date) -> tuple[pd.DataFrame, list[str]]:
 
 
 # -----------------------------------------------------------------------------
-# BallDontLie WNBA prop-line API
+# SportsGameOdds WNBA prop-line API
 # -----------------------------------------------------------------------------
 
 
-def _bdl_headers(api_key: str) -> dict[str, str]:
-    """BallDontLie uses an API key header. Keep both common variants for compatibility."""
+def _sgo_headers(api_key: str) -> dict[str, str]:
     key = str(api_key or "").strip()
     headers = {"Accept": "application/json"}
     if key:
-        headers["Authorization"] = key
-        headers["X-API-KEY"] = key
+        headers["x-api-key"] = key
     return headers
 
 
@@ -776,290 +773,212 @@ def _first_value(source: dict[str, Any], keys: list[str], default: Any = None) -
     return default
 
 
-def _bdl_team_code(value: Any) -> str:
-    if isinstance(value, dict):
-        value = (
-            value.get("abbreviation") or value.get("abbr") or value.get("team_abbreviation")
-            or value.get("name") or value.get("full_name") or value.get("city")
-        )
-    return normalize_team(value)
-
-
-def _bdl_player_name(value: Any, parent: dict[str, Any] | None = None) -> str:
-    parent = parent or {}
-    if isinstance(value, dict):
-        full = value.get("full_name") or value.get("name") or value.get("display_name")
-        if full:
-            return str(full)
-        first = value.get("first_name") or value.get("firstName") or ""
-        last = value.get("last_name") or value.get("lastName") or ""
-        return f"{first} {last}".strip()
-    for key in ["player_name", "athlete_name", "name", "description"]:
-        raw = parent.get(key)
-        if raw:
-            return str(raw)
-    return str(value or "")
-
-
-def normalize_balldontlie_market(value: Any) -> str:
-    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "points": "player_points",
-        "pts": "player_points",
-        "player_points": "player_points",
-        "rebounds": "player_rebounds",
-        "rebs": "player_rebounds",
-        "reb": "player_rebounds",
-        "player_rebounds": "player_rebounds",
-        "assists": "player_assists",
-        "asts": "player_assists",
-        "ast": "player_assists",
-        "player_assists": "player_assists",
-        "points_rebounds_assists": "player_points_rebounds_assists",
-        "points_+_rebounds_+_assists": "player_points_rebounds_assists",
-        "pra": "player_points_rebounds_assists",
-        "player_pra": "player_points_rebounds_assists",
-        "player_points_rebounds_assists": "player_points_rebounds_assists",
-    }
-    return aliases.get(text, text)
-
-
-def _extract_bdl_line_odds(prop: dict[str, Any]) -> tuple[float, float, float, str]:
-    line = _first_value(prop, ["line", "point", "points", "handicap", "value"], np.nan)
-    over_odds = _first_value(prop, ["over_odds", "over_price", "over_american", "over", "price_over"], np.nan)
-    under_odds = _first_value(prop, ["under_odds", "under_price", "under_american", "under", "price_under"], np.nan)
-    side = str(_first_value(prop, ["side", "outcome", "selection", "label", "name"], "") or "").title()
-
-    outcomes = prop.get("outcomes") or prop.get("markets") or prop.get("odds") or prop.get("prices") or prop.get("lines") or []
-    for outcome in _as_list(outcomes):
-        if not isinstance(outcome, dict):
-            continue
-        outcome_side = str(_first_value(outcome, ["side", "name", "label", "selection", "outcome"], "") or "").lower()
-        outcome_line = _first_value(outcome, ["line", "point", "points", "handicap", "value"], np.nan)
-        outcome_price = _first_value(outcome, ["price", "odds", "american_odds", "american"], np.nan)
-        if pd.isna(pd.to_numeric(pd.Series([line]), errors="coerce").iloc[0]) and pd.notna(pd.to_numeric(pd.Series([outcome_line]), errors="coerce").iloc[0]):
-            line = outcome_line
-        if "over" in outcome_side:
-            over_odds = outcome_price
-        elif "under" in outcome_side:
-            under_odds = outcome_price
-
-    price = _first_value(prop, ["price", "odds", "american_odds", "american"], np.nan)
-    if pd.notna(pd.to_numeric(pd.Series([price]), errors="coerce").iloc[0]):
-        if side.lower().startswith("over") and pd.isna(pd.to_numeric(pd.Series([over_odds]), errors="coerce").iloc[0]):
-            over_odds = price
-        elif side.lower().startswith("under") and pd.isna(pd.to_numeric(pd.Series([under_odds]), errors="coerce").iloc[0]):
-            under_odds = price
-
-    return (
-        pd.to_numeric(pd.Series([line]), errors="coerce").iloc[0],
-        pd.to_numeric(pd.Series([over_odds]), errors="coerce").iloc[0],
-        pd.to_numeric(pd.Series([under_odds]), errors="coerce").iloc[0],
-        side,
-    )
-
-
-def _without_collection_fields(source: dict[str, Any]) -> dict[str, Any]:
-    """Keep scalar/object fields from a BallDontLie item while dropping nested market arrays."""
-    skip = {"markets", "outcomes", "prices", "lines", "odds", "bookmakers", "sportsbooks", "vendors"}
-    return {key: value for key, value in source.items() if key not in skip}
-
-
-def _expand_balldontlie_prop_items(items: list[Any]) -> list[dict[str, Any]]:
-    """Flatten the common player-prop payload shapes used by odds APIs.
-
-    BallDontLie may return one row per prop, one row per vendor with nested markets,
-    or one row per market with nested over/under outcomes.  This helper keeps the
-    downstream parser independent from the exact nesting shape.
-    """
-    expanded: list[dict[str, Any]] = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        base = _without_collection_fields(item)
-
-        # Vendor/bookmaker wrapper: {player, bookmakers:[{name, markets:[...]}]}
-        vendor_groups = item.get("bookmakers") or item.get("sportsbooks") or item.get("vendors")
-        if isinstance(vendor_groups, list) and vendor_groups and all(isinstance(v, dict) for v in vendor_groups):
-            for vendor in vendor_groups:
-                vendor_base = {**base}
-                vendor_base["vendor"] = vendor
-                nested_markets = vendor.get("markets") or vendor.get("odds") or vendor.get("lines") or vendor.get("prices")
-                if isinstance(nested_markets, list):
-                    for market in nested_markets:
-                        if isinstance(market, dict):
-                            expanded.append({**vendor_base, **market})
-                else:
-                    expanded.append({**vendor_base, **_without_collection_fields(vendor)})
-            continue
-
-        # Market wrapper: {player, markets:[{prop_type, line, outcomes:[...]}]}
-        nested_markets = item.get("markets")
-        if isinstance(nested_markets, list) and nested_markets and all(isinstance(m, dict) for m in nested_markets):
-            for market in nested_markets:
-                rec = {**base, **market}
-                if "player" not in rec and "player" in item:
-                    rec["player"] = item["player"]
-                expanded.append(rec)
-            continue
-
-        expanded.append(item)
-    return expanded
-
-
-def _bdl_request(api_key: str, path: str, params: dict[str, Any] | None = None, timeout: int = 25) -> requests.Response:
-    url = f"{BALLDONTLIE_WNBA_BASE}{path}"
-    response = requests.get(url, params=params or {}, headers=_bdl_headers(api_key), timeout=timeout)
+def _sgo_request(api_key: str, path: str, params: dict[str, Any] | None = None, timeout: int = 30) -> requests.Response:
+    url = f"{SPORTSGAMEODDS_API_BASE}{path}"
+    response = requests.get(url, params=params or {}, headers=_sgo_headers(api_key), timeout=timeout)
     response.raise_for_status()
     return response
 
 
-def _normalize_bdl_game_payload(payload: dict[str, Any], slate_date: date, source: str) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Normalize BallDontLie game/event-style payloads into board game rows."""
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    rows: list[dict[str, Any]] = []
-    for item in data or []:
-        if not isinstance(item, dict):
-            continue
-        game = item.get("game") if isinstance(item.get("game"), dict) else item
-        if not isinstance(game, dict):
-            game = item
-        game_id = (
-            _first_value(item, ["game_id", "gameId", "gameID", "id"], None)
-            or _first_value(game, ["id", "game_id", "gameId", "gameID"], None)
+def _sgo_team_code(value: Any) -> str:
+    if isinstance(value, dict):
+        names = value.get("names") if isinstance(value.get("names"), dict) else {}
+        value = (
+            value.get("teamID") or names.get("short") or names.get("medium") or names.get("long")
+            or value.get("abbreviation") or value.get("name")
         )
-        home = _bdl_team_code(_first_value(game, [
-            "home_team", "home", "home_team_abbreviation", "home_team_name", "home_team_code"
-        ], {}))
-        away = _bdl_team_code(_first_value(game, [
-            "visitor_team", "away_team", "away", "away_team_abbreviation", "visitor_team_name", "visitor_team_code"
-        ], {}))
-        if home not in TEAM_NAMES or away not in TEAM_NAMES or not game_id:
+    return normalize_team(value)
+
+
+def _sgo_player_name(stat_entity_id: Any, odd: dict[str, Any] | None = None) -> str:
+    odd = odd or {}
+    for key in ["playerName", "player_name", "participantName", "name"]:
+        raw = odd.get(key)
+        if raw:
+            return str(raw)
+    raw = str(stat_entity_id or "").strip()
+    if not raw:
+        return ""
+    # SportsGameOdds player IDs often look like FIRST_LAST_1_WNBA.
+    parts = [p for p in re.split(r"[_\s]+", raw) if p]
+    if len(parts) >= 3 and parts[-1].upper() in {"WNBA", "NBA", "NCAAB"}:
+        parts = parts[:-2]
+    elif len(parts) >= 2 and parts[-1].upper() in {"WNBA", "NBA", "NCAAB"}:
+        parts = parts[:-1]
+    clean = " ".join(parts).replace("-", " ").strip()
+    return " ".join(piece.capitalize() for piece in clean.split())
+
+
+def normalize_sgo_market(stat_id: Any, market_name: Any = "", bet_type_id: Any = "") -> str:
+    raw = "_".join(str(x or "") for x in [stat_id, market_name, bet_type_id]).lower()
+    text = (
+        raw.replace("-", "_")
+        .replace("/", "_")
+        .replace("+", "_")
+        .replace("&", "_")
+        .replace(" ", "_")
+    )
+    while "__" in text:
+        text = text.replace("__", "_")
+    text = text.strip("_")
+
+    has_points = any(tok in text for tok in ["points", "point", "pts"])
+    has_rebounds = any(tok in text for tok in ["rebounds", "rebound", "rebs", "reb"])
+    has_assists = any(tok in text for tok in ["assists", "assist", "asts", "ast"])
+    if has_points and has_rebounds and has_assists:
+        return "player_points_rebounds_assists"
+    if has_points and not has_rebounds and not has_assists:
+        return "player_points"
+    if has_rebounds and not has_points and not has_assists:
+        return "player_rebounds"
+    if has_assists and not has_points and not has_rebounds:
+        return "player_assists"
+    return text
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sportsgameodds_events(api_key: str, slate_date: date) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Fetch WNBA events with odds from SportsGameOdds for the selected slate date."""
+    if not api_key:
+        return pd.DataFrame(), {}
+    start_dt = datetime.combine(slate_date, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    end_dt = datetime.combine(slate_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    params = {
+        "leagueID": "WNBA",
+        "finalized": "false",
+        "oddsAvailable": "true",
+        "startsAfter": start_dt,
+        "startsBefore": end_dt,
+        "limit": 100,
+    }
+    response = _sgo_request(api_key, "/events/", params, timeout=30)
+    payload = response.json()
+    data = payload.get("data", []) or []
+    rows: list[dict[str, Any]] = []
+    for event in data:
+        if not isinstance(event, dict):
             continue
-        game_time = _first_value(game, ["date", "datetime", "game_time", "start_time", "scheduled"], "")
+        event_id = event.get("eventID")
+        teams = event.get("teams", {}) if isinstance(event.get("teams", {}), dict) else {}
+        home = _sgo_team_code(teams.get("home", {}))
+        away = _sgo_team_code(teams.get("away", {}))
+        if home not in TEAM_NAMES or away not in TEAM_NAMES or not event_id:
+            continue
+        status = event.get("status", {}) if isinstance(event.get("status", {}), dict) else {}
         rows.append({
-            "BallDontLieGameID": str(game_id),
-            "EventID": str(game_id),
+            "SportsGameOddsEventID": str(event_id),
+            "EventID": str(event_id),
             "GameDate": slate_date,
-            "GameTimeUTC": str(game_time or ""),
+            "GameTimeUTC": str(status.get("startsAt") or ""),
             "Away": away,
             "Home": home,
             "Game": f"{away} @ {home}",
-            "Source": source,
+            "Source": "SportsGameOdds",
+            "PlayerPropsCount": sum(
+                1 for odd in (event.get("odds", {}) or {}).values()
+                if isinstance(odd, dict) and str(odd.get("statEntityID") or "") not in ["all", "home", "away", ""]
+            ),
         })
-    frame = pd.DataFrame(rows).drop_duplicates(["BallDontLieGameID"]) if rows else pd.DataFrame()
-    meta_obj = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
-    meta = {"provider": "BallDontLie", "endpoint": source, "objects": str(len(data or [])), **{str(k): str(v) for k, v in meta_obj.items()}}
+    frame = pd.DataFrame(rows).drop_duplicates(["SportsGameOddsEventID"]) if rows else pd.DataFrame()
+    meta = {
+        "provider": "SportsGameOdds",
+        "endpoint": "/events/",
+        "objects": str(len(data)),
+        "nextCursor": str(payload.get("nextCursor", "") or ""),
+    }
     return frame, meta
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_balldontlie_events(api_key: str, slate_date: date) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Discover BallDontLie WNBA game IDs for the slate without using player-prop odds.
-
-    The live player props endpoint requires a BallDontLie game_id. The old version tried
-    /wnba/v1/odds?dates=..., which can return HTTP 400. This function now tries game-style
-    endpoints first and safely returns an empty frame if the user's plan/API does not expose
-    game lookup. Manual game IDs can still be used in the UI.
-    """
-    if not api_key:
-        return pd.DataFrame(), {}
-
-    date_str = slate_date.isoformat()
-    attempts: list[tuple[str, dict[str, Any]]] = [
-        ("/games", {"dates[]": date_str, "per_page": 100}),
-        ("/games", {"dates": [date_str], "per_page": 100}),
-        ("/games", {"start_date": date_str, "end_date": date_str, "per_page": 100}),
-        ("/schedule", {"dates[]": date_str, "per_page": 100}),
-    ]
-    errors: list[str] = []
-    for path, params in attempts:
-        try:
-            response = _bdl_request(api_key, path, params, timeout=20)
-            payload = response.json()
-            frame, meta = _normalize_bdl_game_payload(payload, slate_date, f"BallDontLie {path}")
-            if not frame.empty:
-                return frame, meta
-            errors.append(f"{path}: no games returned")
-        except Exception as exc:
-            errors.append(f"{path}: {type(exc).__name__}: {exc}")
-            continue
-
-    return pd.DataFrame(), {"provider": "BallDontLie", "endpoint": "game lookup", "errors": " | ".join(errors[:4])}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_balldontlie_player_props(
+def fetch_sportsgameodds_event_props(
     api_key: str,
-    game_id: str,
-    prop_type: str = "",
-    vendors: tuple[str, ...] = (),
+    event_id: str,
+    bookmaker_ids: tuple[str, ...] = (),
+    include_alt_lines: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
-    if not api_key or not game_id:
+    """Fetch and parse player prop quote rows for one SportsGameOdds event."""
+    if not api_key or not event_id:
         return pd.DataFrame(), {}
-    params: dict[str, Any] = {"game_id": game_id}
-    if prop_type:
-        params["prop_type"] = prop_type
-    if vendors:
-        params["vendors"] = list(vendors)
-    response = _bdl_request(api_key, "/odds/player_props", params, timeout=30)
+    params: dict[str, Any] = {
+        "eventIDs": str(event_id),
+        "includeOpposingOdds": "true",
+        "includeAltLines": "true" if include_alt_lines else "false",
+    }
+    if bookmaker_ids:
+        params["bookmakerID"] = ",".join(bookmaker_ids)
+    response = _sgo_request(api_key, "/events/", params, timeout=35)
     payload = response.json()
-    raw_items = payload.get("data", []) or []
-    expanded_items = _expand_balldontlie_prop_items(raw_items)
+    events = payload.get("data", []) or []
+    if not events:
+        return pd.DataFrame(), {"provider": "SportsGameOdds", "endpoint": "/events/", "raw_events": "0", "parsed_quote_rows": "0"}
+
+    event = events[0]
+    odds = event.get("odds", {}) if isinstance(event.get("odds", {}), dict) else {}
     rows: list[dict[str, Any]] = []
-    for prop in expanded_items:
-        if not isinstance(prop, dict):
+    wanted_markets = {config["market"] for config in TARGETS.values()}
+    seen_odd_count = 0
+    player_prop_odd_count = 0
+    raw_market_labels: set[str] = set()
+
+    for odd_id, odd in odds.items():
+        if not isinstance(odd, dict):
             continue
-        player = prop.get("player") or prop.get("athlete") or {}
-        player_name = _bdl_player_name(player, prop)
-        market = normalize_balldontlie_market(_first_value(prop, ["prop_type", "market", "market_key", "stat_type", "type"], ""))
-        market_type = str(_first_value(prop, ["market_type", "bet_type", "wager_type"], "over_under") or "over_under").lower()
-        vendor_value = _first_value(prop, ["vendor", "sportsbook", "book", "bookmaker"], "BallDontLie")
-        if isinstance(vendor_value, dict):
-            book = str(vendor_value.get("name") or vendor_value.get("display_name") or vendor_value.get("key") or "BallDontLie")
-            book_key = str(vendor_value.get("key") or vendor_value.get("slug") or book).lower().replace(" ", "_")
-        else:
-            book = str(vendor_value or "BallDontLie")
-            book_key = book.lower().replace(" ", "_")
-        line, over_odds, under_odds, side = _extract_bdl_line_odds(prop)
-        if market not in {config["market"] for config in TARGETS.values()}:
+        seen_odd_count += 1
+        stat_entity = str(odd.get("statEntityID") or "")
+        if stat_entity in {"", "all", "home", "away"}:
             continue
-        if market_type and "milestone" in market_type:
+        player_prop_odd_count += 1
+        stat_id = odd.get("statID", "")
+        market_name = odd.get("marketName", "")
+        bet_type = str(odd.get("betTypeID", "") or "").lower()
+        side = str(odd.get("sideID", "") or "").title()
+        raw_market_labels.add(str(stat_id or market_name or odd_id)[:80])
+        market = normalize_sgo_market(stat_id, market_name, bet_type)
+        if market not in wanted_markets:
             continue
-        if not player_name or pd.isna(line):
+        # Keep only over/under style rows for the dashboard.
+        side_lower = side.lower()
+        if side_lower not in {"over", "under"}:
             continue
-        # Preferred row: one over/under row containing both prices when possible.
-        if pd.notna(over_odds):
+        player_name = _sgo_player_name(stat_entity, odd)
+        if not player_name:
+            continue
+        by_book = odd.get("byBookmaker", {}) if isinstance(odd.get("byBookmaker", {}), dict) else {}
+        for bookmaker_id, book_data in by_book.items():
+            if not isinstance(book_data, dict):
+                continue
+            if not book_data.get("available", True):
+                continue
+            line = pd.to_numeric(pd.Series([book_data.get("overUnder")]), errors="coerce").iloc[0]
+            price = pd.to_numeric(pd.Series([book_data.get("odds")]), errors="coerce").iloc[0]
+            if pd.isna(line):
+                continue
+            book_key = str(bookmaker_id or "").lower().replace(" ", "_")
+            book_label = BOOKMAKER_LABELS.get(book_key, str(bookmaker_id))
             rows.append({
-                "EventID": str(game_id), "BallDontLieGameID": str(game_id), "Bookmaker": book,
-                "BookmakerKey": book_key, "Market": market, "Player": player_name,
-                "NameKey": normalize_player_name(player_name), "Side": "Over", "Line": line,
-                "Odds": over_odds, "Updated": str(_first_value(prop, ["updated_at", "last_update", "updated"], "")),
-                "MarketType": market_type, "Source": "BallDontLie",
+                "EventID": str(event_id),
+                "SportsGameOddsEventID": str(event_id),
+                "Bookmaker": book_label,
+                "BookmakerKey": book_key,
+                "Market": market,
+                "Player": player_name,
+                "NameKey": normalize_player_name(player_name),
+                "Side": side,
+                "Line": float(line),
+                "Odds": price if pd.notna(price) else np.nan,
+                "Updated": str(book_data.get("lastUpdatedAt") or ""),
+                "MarketType": str(bet_type or "ou"),
+                "Source": "SportsGameOdds",
+                "OddID": str(odd_id),
             })
-        if pd.notna(under_odds):
-            rows.append({
-                "EventID": str(game_id), "BallDontLieGameID": str(game_id), "Bookmaker": book,
-                "BookmakerKey": book_key, "Market": market, "Player": player_name,
-                "NameKey": normalize_player_name(player_name), "Side": "Under", "Line": line,
-                "Odds": under_odds, "Updated": str(_first_value(prop, ["updated_at", "last_update", "updated"], "")),
-                "MarketType": market_type, "Source": "BallDontLie",
-            })
-        if pd.isna(over_odds) and pd.isna(under_odds) and side:
-            rows.append({
-                "EventID": str(game_id), "BallDontLieGameID": str(game_id), "Bookmaker": book,
-                "BookmakerKey": book_key, "Market": market, "Player": player_name,
-                "NameKey": normalize_player_name(player_name), "Side": side, "Line": line,
-                "Odds": np.nan, "Updated": str(_first_value(prop, ["updated_at", "last_update", "updated"], "")),
-                "MarketType": market_type, "Source": "BallDontLie",
-            })
-    meta_obj = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
     meta = {
-        "provider": "BallDontLie",
-        "raw_count": str(len(raw_items)),
-        "expanded_count": str(len(expanded_items)),
+        "provider": "SportsGameOdds",
+        "endpoint": "/events/",
+        "raw_events": str(len(events)),
+        "raw_odds": str(seen_odd_count),
+        "player_prop_odds": str(player_prop_odd_count),
         "parsed_quote_rows": str(len(rows)),
-        **{str(k): str(v) for k, v in meta_obj.items()},
+        "raw_markets": ", ".join(sorted(x for x in raw_market_labels if x)[:12]),
     }
     return pd.DataFrame(rows), meta
 
@@ -1096,7 +1015,7 @@ def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]
         "OverOdds": over_odds,
         "UnderOdds": under_odds,
         "MarketOverProb": no_vig_over_probability(over_odds, under_odds),
-        "Source": source_mode if source_mode != "Consensus" else f"BallDontLie consensus ({len(books)} books)",
+        "Source": source_mode if source_mode != "Consensus" else f"SportsGameOdds consensus ({len(books)} books)",
     }
 
 
@@ -1691,13 +1610,13 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Automatic prop lines")
-    bdl_api_key = st.text_input("BallDontLie API key (session only)", type="password")
+    sgo_api_key = st.text_input("SportsGameOdds API key (session only)", type="password")
     odds_source_mode = st.selectbox("Line source", ["Consensus"])
-    bdl_vendors_text = st.text_input("Optional BallDontLie vendors", value="", help="Comma-separated. Leave blank for all available vendors.")
+    sgo_bookmakers_text = st.text_input("Optional SportsGameOdds bookmaker IDs", value="", help="Comma-separated IDs like hardrockbet,fanduel,draftkings. Leave blank for all available books.")
 
     if st.button("Clear cached data", width="stretch"):
         st.cache_data.clear()
-        for key in ["wnba_board", "wnba_games", "wnba_odds", "wnba_player_logs_data", "wnba_team_logs_data", "wnba_data_source", "wnba_balldontlie_events"]:
+        for key in ["wnba_board", "wnba_games", "wnba_odds", "wnba_player_logs_data", "wnba_team_logs_data", "wnba_data_source", "wnba_sgo_events"]:
             st.session_state.pop(key, None)
         st.rerun()
 
@@ -1733,14 +1652,14 @@ if data_source and not player_logs.empty:
 
 if load_schedule or "wnba_games" not in st.session_state:
     games, schedule_errors = fetch_official_schedule(slate_date)
-    if games.empty and bdl_api_key:
+    if games.empty and sgo_api_key:
         try:
-            bdl_events, event_meta = fetch_balldontlie_events(bdl_api_key, slate_date)
-            if not bdl_events.empty:
-                games = bdl_events.copy()
-                st.session_state["wnba_balldontlie_events"] = bdl_events
+            sgo_events, event_meta = fetch_sportsgameodds_events(sgo_api_key, slate_date)
+            if not sgo_events.empty:
+                games = sgo_events.copy()
+                st.session_state["wnba_sgo_events"] = sgo_events
         except Exception as exc:
-            schedule_errors.append(f"BallDontLie events: {type(exc).__name__}: {exc}")
+            schedule_errors.append(f"SportsGameOdds events: {type(exc).__name__}: {exc}")
     st.session_state["wnba_games"] = games
     st.session_state["wnba_schedule_errors"] = schedule_errors
 
@@ -1786,108 +1705,105 @@ if board.empty:
     st.stop()
 
 # Fetch props after board exists
-with st.expander("Automatic BallDontLie prop-line fetch", expanded=False):
+with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
     market_options = {target: config["market"] for target, config in TARGETS.items()}
     selected_markets = st.multiselect("Markets", list(market_options), default=list(market_options))
     odds_games = st.multiselect("Games to query", board["Game"].drop_duplicates().tolist(), default=board["Game"].drop_duplicates().tolist())
-    st.caption("BallDontLie player props require a BallDontLie game_id. Use Find IDs first; if your API plan blocks game lookup, paste manual IDs below. Player props are live and may be removed near game completion.")
+    include_alt_lines = st.checkbox("Include alt lines", value=False, help="Usually leave this off for main prop-line comparison. Turn on if you want alternate lines included in the raw quotes.")
+    st.caption("SportsGameOdds uses the /v2/events endpoint. Player props are inside each event's odds object; statEntityID identifies the player, statID identifies the stat, and each bookmaker quote carries the line in overUnder.")
 
-    if bdl_api_key:
-        if st.button("Find BallDontLie game IDs", width="stretch"):
+    if sgo_api_key:
+        if st.button("Find SportsGameOdds WNBA event IDs", width="stretch"):
             try:
-                bdl_events, meta = fetch_balldontlie_events(bdl_api_key, slate_date)
-                st.session_state["wnba_balldontlie_events"] = bdl_events
+                sgo_events, meta = fetch_sportsgameodds_events(sgo_api_key, slate_date)
+                st.session_state["wnba_sgo_events"] = sgo_events
                 st.session_state["wnba_odds_meta"] = meta
-                if bdl_events.empty:
-                    st.warning("No BallDontLie games/odds were returned for this slate date. Use manual IDs below if you have them.")
+                if sgo_events.empty:
+                    st.warning("No SportsGameOdds WNBA events with available odds were returned for this slate date. Use manual event IDs below if you have them.")
                 else:
-                    st.success(f"Found {len(bdl_events):,} BallDontLie game IDs.")
+                    st.success(f"Found {len(sgo_events):,} SportsGameOdds event IDs.")
             except Exception as exc:
-                st.error(f"BallDontLie game lookup failed: {type(exc).__name__}: {exc}")
+                st.error(f"SportsGameOdds event lookup failed: {type(exc).__name__}: {exc}")
 
-    bdl_events = st.session_state.get("wnba_balldontlie_events", pd.DataFrame())
-    if not bdl_events.empty:
-        st.dataframe(bdl_events[[c for c in ["Game", "BallDontLieGameID", "Source"] if c in bdl_events.columns]], hide_index=True, width="stretch")
+    sgo_events = st.session_state.get("wnba_sgo_events", pd.DataFrame())
+    if not sgo_events.empty:
+        display_cols = [c for c in ["Game", "SportsGameOddsEventID", "PlayerPropsCount", "GameTimeUTC", "Source"] if c in sgo_events.columns]
+        st.dataframe(sgo_events[display_cols], hide_index=True, width="stretch")
 
-    manual_bdl_ids = st.text_area(
-        "Manual BallDontLie game IDs (optional)",
+    manual_sgo_ids = st.text_area(
+        "Manual SportsGameOdds event IDs (optional)",
         value="",
         height=80,
-        help="One per line, for example: NYL @ IND = 12345",
+        help="One per line, for example: LAS @ ATL = abc123",
     )
 
-    def _manual_bdl_id_lookup(text: str) -> dict[str, str]:
+    def _manual_sgo_id_lookup(text: str) -> dict[str, str]:
         lookup: dict[str, str] = {}
         for line in str(text or "").splitlines():
             if "=" not in line:
                 continue
-            game, game_id = line.split("=", 1)
+            game, event_id = line.split("=", 1)
             game = game.strip()
-            game_id = game_id.strip()
-            if game and game_id:
-                lookup[game] = game_id
+            event_id = event_id.strip()
+            if game and event_id:
+                lookup[game] = event_id
         return lookup
 
-    if st.button("Fetch selected BallDontLie WNBA prop lines", width="stretch"):
-        if not bdl_api_key:
-            st.error("Enter your temporary BallDontLie API key in the sidebar.")
+    if st.button("Fetch selected SportsGameOdds WNBA prop lines", width="stretch"):
+        if not sgo_api_key:
+            st.error("Enter your temporary SportsGameOdds API key in the sidebar.")
         else:
             try:
-                manual_lookup = _manual_bdl_id_lookup(manual_bdl_ids)
-                if bdl_events.empty and not manual_lookup:
-                    bdl_events, meta = fetch_balldontlie_events(bdl_api_key, slate_date)
-                    st.session_state["wnba_balldontlie_events"] = bdl_events
+                manual_lookup = _manual_sgo_id_lookup(manual_sgo_ids)
+                if sgo_events.empty and not manual_lookup:
+                    sgo_events, meta = fetch_sportsgameodds_events(sgo_api_key, slate_date)
+                    st.session_state["wnba_sgo_events"] = sgo_events
                     st.session_state["wnba_odds_meta"] = meta
-                elif bdl_events.empty and manual_lookup:
-                    # Manual IDs are enough to fetch props; do not make a game-lookup request that could 400.
-                    meta = {"provider": "BallDontLie", "endpoint": "manual game IDs"}
+                elif sgo_events.empty and manual_lookup:
+                    meta = {"provider": "SportsGameOdds", "endpoint": "manual event IDs"}
                     st.session_state["wnba_odds_meta"] = meta
-                event_lookup = bdl_events.set_index("Game")["BallDontLieGameID"].astype(str).to_dict() if not bdl_events.empty else {}
+
+                event_lookup = sgo_events.set_index("Game")["SportsGameOddsEventID"].astype(str).to_dict() if not sgo_events.empty else {}
                 event_lookup.update(manual_lookup)
-                vendors = tuple(v.strip() for v in str(bdl_vendors_text or "").split(",") if v.strip())
+                bookmaker_ids = tuple(v.strip().lower().replace(" ", "") for v in str(sgo_bookmakers_text or "").split(",") if v.strip())
                 wanted_markets = {market_options[target] for target in selected_markets}
                 frames = []
-                last_meta: dict[str, str] = {"provider": "BallDontLie"}
+                last_meta: dict[str, str] = {"provider": "SportsGameOdds"}
                 missing_games = []
                 debug_fetch_rows: list[dict[str, Any]] = []
                 for game in odds_games:
-                    bdl_game_id = event_lookup.get(game)
-                    if not bdl_game_id:
+                    sgo_event_id = event_lookup.get(game)
+                    if not sgo_event_id:
                         missing_games.append(game)
                         continue
-                    game_frames: list[pd.DataFrame] = []
-                    for market in sorted(wanted_markets):
-                        frame, last_meta = fetch_balldontlie_player_props(bdl_api_key, str(bdl_game_id), market, vendors)
-                        debug_fetch_rows.append({"Game": game, "BallDontLieGameID": str(bdl_game_id), "Market": market, **last_meta})
-                        if frame is not None and not frame.empty:
-                            game_frames.append(frame)
-                    frame = pd.concat(game_frames, ignore_index=True) if game_frames else pd.DataFrame()
-                    if not frame.empty:
+                    frame, last_meta = fetch_sportsgameodds_event_props(sgo_api_key, str(sgo_event_id), bookmaker_ids, include_alt_lines)
+                    debug_fetch_rows.append({"Game": game, "SportsGameOddsEventID": str(sgo_event_id), **last_meta})
+                    if frame is not None and not frame.empty:
                         frame = frame[frame["Market"].isin(wanted_markets)].copy()
-                        # Re-key the quote rows to the board's event ID so player lines merge correctly.
                         board_event_ids = board.loc[board["Game"].eq(game), "EventID"].dropna().astype(str).unique()
                         if len(board_event_ids):
                             frame["EventID"] = board_event_ids[0]
-                    frames.append(frame)
+                    frames.append(frame if frame is not None else pd.DataFrame())
                 if debug_fetch_rows:
-                    st.session_state["wnba_balldontlie_fetch_debug"] = pd.DataFrame(debug_fetch_rows)
+                    st.session_state["wnba_sgo_fetch_debug"] = pd.DataFrame(debug_fetch_rows)
                 combined = combine_odds_frames(frames)
                 st.session_state["wnba_odds"] = combined
                 st.session_state["wnba_odds_meta"] = last_meta
                 if missing_games:
-                    st.warning("Missing BallDontLie game IDs for: " + ", ".join(missing_games))
+                    st.warning("Missing SportsGameOdds event IDs for: " + ", ".join(missing_games))
                 if combined.empty:
-                    st.warning("No matching player props were returned. Try leaving vendors blank or checking the BallDontLie game IDs.")
+                    st.warning("No matching SportsGameOdds player props were parsed. Leave bookmaker IDs blank first, make sure WNBA player props are available for the game, and check the debug table below.")
                 st.rerun()
             except Exception as exc:
-                st.error(f"BallDontLie prop fetch failed: {type(exc).__name__}: {exc}")
+                st.error(f"SportsGameOdds prop fetch failed: {type(exc).__name__}: {exc}")
     meta = st.session_state.get("wnba_odds_meta", {})
     if meta:
-        st.caption("BallDontLie meta: " + " · ".join(f"{k}: {v}" for k, v in meta.items() if v))
-    debug_fetch = st.session_state.get("wnba_balldontlie_fetch_debug", pd.DataFrame())
+        st.caption("SportsGameOdds meta: " + " · ".join(f"{k}: {v}" for k, v in meta.items() if v))
+    debug_fetch = st.session_state.get("wnba_sgo_fetch_debug", pd.DataFrame())
     if isinstance(debug_fetch, pd.DataFrame) and not debug_fetch.empty:
-        with st.expander("BallDontLie fetch debug", expanded=False):
+        with st.expander("SportsGameOdds fetch debug", expanded=False):
             st.dataframe(debug_fetch, hide_index=True, width="stretch")
+
 
 odds = st.session_state.get("wnba_odds", pd.DataFrame())
 board = apply_market_quotes(board, odds, odds_source_mode)
@@ -2155,6 +2071,6 @@ with notes_tab:
         - Save snapshots before tipoff. Backtesting automatically excludes snapshots generated after the recorded game start.
         - Calibrate each target separately and only when chronological holdout error improves.
 
-        Data sources: official WNBA Stats for completed game logs; official WNBA schedule/injury pages when available; BallDontLie WNBA API for optional prop lines.
+        Data sources: official WNBA Stats for completed game logs; official WNBA schedule/injury pages when available; SportsGameOdds WNBA API for optional prop lines.
         """
     )
