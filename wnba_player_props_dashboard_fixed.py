@@ -180,7 +180,7 @@ DEFAULT_STAT_SDS = {"Points": 5.5, "Rebounds": 2.7, "Assists": 2.2, "PRA": 7.5}
 # Presentation
 # -----------------------------------------------------------------------------
 
-st.set_page_config(page_title="WNBA Player Props Lab", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="WNBA Player Props Lab", page_icon="ðŸ€", layout="wide")
 
 
 def inject_css() -> None:
@@ -1208,12 +1208,12 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
     if (/\d/.test(x)) return false;
     if (/^(WNBA|NBA|More|Less|Goblin|Demon|Discount|Fantasy Score|Projected|Search|Today|Tomorrow|Live|Popular|All|Board|Promo|Lineup)$/i.test(x)) return false;
     if (marketWords.some(w => x.toLowerCase() === w.toLowerCase())) return false;
-    return /^[A-Za-z .'’\-]+$/.test(x);
+    return /^[A-Za-z .'â€™\-]+$/.test(x);
   }
 
   function parseBlock(text, source="dom") {
     const raw = (text || "").replace(/\r/g, "\n");
-    const compactMatch = raw.match(new RegExp(`([A-Z][A-Za-z .'’\\-]{2,})\\s+(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i"));
+    const compactMatch = raw.match(new RegExp(`([A-Z][A-Za-z .'â€™\\-]{2,})\\s+(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i"));
     if (compactMatch) {
       addRow({ player: compactMatch[1], line: compactMatch[2], market: compactMatch[3], raw_text: raw.slice(0, 1200) }, source);
     }
@@ -1436,7 +1436,7 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
   await fetchObservedProjectionResources();
 
   const rawText = document.body.innerText || "";
-  rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g).forEach(block => parseBlock(block, "body_text"));
+  rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'â€™\-]{2,}\b\s*\n)/g).forEach(block => parseBlock(block, "body_text"));
 
   const payload = {
     exported_at: new Date().toISOString(),
@@ -1559,7 +1559,7 @@ def _is_probable_player_name(value: Any) -> bool:
         return False
     if prizepicks_market_to_dashboard(text):
         return False
-    return bool(re.match(r"^[A-Za-z .'’\-]+$", text.strip()))
+    return bool(re.match(r"^[A-Za-z .'â€™\-]+$", text.strip()))
 
 
 def _parse_prizepicks_text_rows(text: str) -> list[dict[str, Any]]:
@@ -1752,9 +1752,9 @@ def _parse_prizepicks_plain_text(text: str) -> pd.DataFrame:
         line = re.sub(r"\s+", " ", raw_line).strip()
         if not line:
             continue
-        match = re.search(rf"(?P<player>[A-Za-z .'’\-]{{3,55}}?)\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<market>{market_terms})\b", line, flags=re.I)
+        match = re.search(rf"(?P<player>[A-Za-z .'â€™\-]{{3,55}}?)\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<market>{market_terms})\b", line, flags=re.I)
         if not match:
-            match = re.search(rf"(?P<player>[A-Za-z .'’\-]{{3,55}}?)\s+(?P<market>{market_terms})\b\s*(?P<val>\d+(?:\.\d+)?)", line, flags=re.I)
+            match = re.search(rf"(?P<player>[A-Za-z .'â€™\-]{{3,55}}?)\s+(?P<market>{market_terms})\b\s*(?P<val>\d+(?:\.\d+)?)", line, flags=re.I)
         if not match:
             continue
         player = re.sub(r"\b(More|Less|Goblin|Demon|Discount|WNBA)\b", "", match.group("player"), flags=re.I).strip(" -|")
@@ -2201,16 +2201,18 @@ def calculate_prop_probabilities(board: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 
-def build_snapshot(board: pd.DataFrame, slate_date: date) -> pd.DataFrame:
+def build_snapshot(board: pd.DataFrame, slate_date: date, snapshot_type: str = "pregame_live") -> pd.DataFrame:
     snapshot = board.copy()
     snapshot["SlateDate"] = slate_date
     snapshot["GeneratedAtUTC"] = pd.Timestamp.now(tz="UTC").isoformat()
     snapshot["ModelVersion"] = MODEL_VERSION
+    snapshot["SnapshotType"] = snapshot_type
+    snapshot["RetroClean"] = str(snapshot_type).lower().replace("-", "_") == "retro_clean"
     for target, config in TARGETS.items():
         snapshot[config["actual"]] = np.nan
     snapshot["ResultStatus"] = ""
     preferred = [
-        "SlateDate", "GameTimeUTC", "GeneratedAtUTC", "ModelVersion", "EventID", "PlayerID", "Player",
+        "SlateDate", "GameTimeUTC", "GeneratedAtUTC", "ModelVersion", "SnapshotType", "RetroClean", "EventID", "PlayerID", "Player",
         "Team", "Opponent", "HomeAway", "Game", "Games", "Avg_MIN", "Proj_MIN", "Manual_MIN",
         "Usage_Adjustment", "Injury_Status", "Role", "Confidence", "Calibration_Applied", "Calibration_Targets",
     ]
@@ -2243,10 +2245,18 @@ def normalize_history(history: pd.DataFrame) -> pd.DataFrame:
             if column not in result.columns:
                 result[column] = np.nan
             result[column] = pd.to_numeric(result[column], errors="coerce")
+    if "SnapshotType" not in result.columns:
+        result["SnapshotType"] = "pregame_live"
+    result["SnapshotType"] = result["SnapshotType"].fillna("pregame_live").astype(str).str.lower().str.replace("-", "_", regex=False).str.replace(" ", "_", regex=False)
+    if "RetroClean" not in result.columns:
+        result["RetroClean"] = False
+    result["RetroClean"] = result["RetroClean"].map(lambda value: str(value).strip().lower() in {"true", "1", "yes", "y", "retro_clean"})
+    result.loc[result["SnapshotType"].eq("retro_clean"), "RetroClean"] = True
     result["SnapshotAfterStart"] = (
         result["GeneratedAtUTC"].notna() & result["GameTimeUTC"].notna()
         & result["GeneratedAtUTC"].gt(result["GameTimeUTC"])
     )
+    result["CleanForCalibration"] = (~result["SnapshotAfterStart"].fillna(False)) | result["RetroClean"].fillna(False)
     if "ResultStatus" not in result.columns:
         result["ResultStatus"] = ""
     return result
@@ -2289,13 +2299,21 @@ def fill_actual_results(history: pd.DataFrame, player_logs: pd.DataFrame) -> tup
     return normalize_history(result), {"matched": int(matched.sum()), "unmatched": int((~matched).sum())}
 
 
-def latest_pregame_history(history: pd.DataFrame) -> pd.DataFrame:
+def latest_pregame_history(history: pd.DataFrame, include_retro_clean: bool = True) -> pd.DataFrame:
     frame = normalize_history(history)
     if frame.empty:
         return frame
-    frame = frame[~frame["SnapshotAfterStart"].fillna(False)].copy()
-    frame = frame.sort_values("GeneratedAtUTC")
-    return frame.drop_duplicates(["SlateDate", "EventID", "PlayerID"], keep="last")
+    if include_retro_clean:
+        frame = frame[frame["CleanForCalibration"].fillna(False)].copy()
+    else:
+        frame = frame[~frame["SnapshotAfterStart"].fillna(False)].copy()
+    frame = frame.sort_values(["SlateDate", "GeneratedAtUTC"], na_position="last")
+    dedupe_cols = [c for c in ["SlateDate", "EventID", "PlayerID"] if c in frame.columns]
+    if len(dedupe_cols) < 3 and "Game" in frame.columns:
+        dedupe_cols = [c for c in ["SlateDate", "Game", "PlayerID"] if c in frame.columns]
+    if dedupe_cols:
+        return frame.drop_duplicates(dedupe_cols, keep="last")
+    return frame
 
 
 def projection_metrics(history: pd.DataFrame, target: str) -> dict[str, float]:
@@ -2325,7 +2343,7 @@ def score_bucket_table(history: pd.DataFrame, target: str) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
     bins = [-0.001, 30, 45, 55, 70, 85, 100.001]
-    labels = ["0–29", "30–44", "45–54", "55–69", "70–84", "85–100"]
+    labels = ["0â€“29", "30â€“44", "45â€“54", "55â€“69", "70â€“84", "85â€“100"]
     frame["Score_Bucket"] = pd.cut(frame[config["score"]], bins=bins, labels=labels, right=False)
     if config["line"] in frame.columns:
         frame["Over"] = np.where(frame[config["line"]].notna(), frame[config["actual"]] > frame[config["line"]], np.nan)
@@ -2365,7 +2383,7 @@ def probability_calibration_table(records: pd.DataFrame) -> tuple[pd.DataFrame, 
     if records is None or records.empty:
         return pd.DataFrame(), np.nan
     bins = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 1.001]
-    labels = ["50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75%+"]
+    labels = ["50â€“54%", "55â€“59%", "60â€“64%", "65â€“69%", "70â€“74%", "75%+"]
     frame = records.copy()
     frame["Probability_Bucket"] = pd.cut(frame["Preferred_Probability"], bins=bins, labels=labels, right=False)
     grouped = frame.groupby("Probability_Bucket", observed=False).agg(
@@ -2457,7 +2475,7 @@ def manual_games_frame(slate_date: date, text: str) -> pd.DataFrame:
 
 inject_css()
 st.markdown('<div class="app-kicker">WNBA PLAYER PROPS LAB</div>', unsafe_allow_html=True)
-st.title("🏀 WNBA Points · Rebounds · Assists · PRA")
+st.title("ðŸ€ WNBA Points Â· Rebounds Â· Assists Â· PRA")
 st.caption("Minutes-driven projections, target-specific scores, prop-line comparison and built-in backtesting.")
 
 with st.sidebar:
@@ -2519,7 +2537,7 @@ if load_data or "wnba_player_logs_data" not in st.session_state:
             player_logs = read_uploaded_csv(player_csv, normalize_player_logs)
             team_logs = read_uploaded_csv(team_csv, normalize_team_logs)
         else:
-            with st.spinner("Loading WNBA game logs (official source, then automatic fallback)…"):
+            with st.spinner("Loading WNBA game logs (official source, then automatic fallback)â€¦"):
                 player_logs, team_logs, data_source = load_official_game_logs(season, season_type)
         if player_csv is not None and team_csv is not None:
             data_source = "Uploaded CSV files"
@@ -2534,7 +2552,7 @@ player_logs = st.session_state.get("wnba_player_logs_data", pd.DataFrame())
 team_logs = st.session_state.get("wnba_team_logs_data", pd.DataFrame())
 data_source = st.session_state.get("wnba_data_source", "")
 if data_source and not player_logs.empty:
-    st.success(f"WNBA data loaded from: {data_source} · {len(player_logs):,} player-game rows")
+    st.success(f"WNBA data loaded from: {data_source} Â· {len(player_logs):,} player-game rows")
 
 if load_schedule or "wnba_games" not in st.session_state:
     games, schedule_errors = fetch_official_schedule(slate_date)
@@ -2557,7 +2575,7 @@ with st.expander("Slate games and manual fallback", expanded=games.empty):
     errors = st.session_state.get("wnba_schedule_errors", [])
     if errors:
         st.caption("Schedule connection details: " + " | ".join(errors[:3]))
-    manual_text = st.text_area("Manual games — one per line, e.g. IND @ NYL", value="", height=100)
+    manual_text = st.text_area("Manual games â€” one per line, e.g. IND @ NYL", value="", height=100)
     if st.button("Use manual games"):
         manual = manual_games_frame(slate_date, manual_text)
         if manual.empty:
@@ -2578,7 +2596,7 @@ if build_board_button:
     if player_logs.empty or selected_game_frame.empty:
         st.warning("Load stats and select at least one game first.")
     else:
-        with st.spinner("Building minutes, rate and matchup projections…"):
+        with st.spinner("Building minutes, rate and matchup projectionsâ€¦"):
             raw_board = build_base_board(player_logs, team_logs, selected_game_frame)
             calibrated = apply_projection_calibration(raw_board, active_calibration)
             st.session_state["wnba_board"] = calibrated
@@ -2591,7 +2609,7 @@ if board.empty:
     st.stop()
 
 # Fetch/import props after board exists
-with st.expander("PrizePicks line import — screenshot/CSV workflow", expanded=False):
+with st.expander("PrizePicks line import â€” screenshot/CSV workflow", expanded=False):
     st.markdown(
         """
         Use this when APIs are stale or missing PrizePicks. No browser console or auto-scroll scripts are needed.
@@ -2776,7 +2794,7 @@ with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
                 st.error(f"SportsGameOdds prop fetch failed: {type(exc).__name__}: {exc}")
     meta = st.session_state.get("wnba_odds_meta", {})
     if meta:
-        st.caption("SportsGameOdds meta: " + " · ".join(f"{k}: {v}" for k, v in meta.items() if v))
+        st.caption("SportsGameOdds meta: " + " Â· ".join(f"{k}: {v}" for k, v in meta.items() if v))
     debug_fetch = st.session_state.get("wnba_sgo_fetch_debug", pd.DataFrame())
     if isinstance(debug_fetch, pd.DataFrame) and not debug_fetch.empty:
         with st.expander("SportsGameOdds fetch debug", expanded=False):
@@ -2926,7 +2944,18 @@ with minutes_tab:
 
 with backtest_tab:
     st.markdown("### Save the current slate before tipoff")
-    snapshot = build_snapshot(board, slate_date)
+    snapshot_type_label = st.selectbox(
+        "Snapshot type",
+        ["pregame_live", "retro_clean", "postgame_dirty"],
+        index=0,
+        format_func=lambda value: {
+            "pregame_live": "Pregame live â€” normal saved-before-tipoff slate",
+            "retro_clean": "Retro-clean backfill â€” recreated with only pregame data",
+            "postgame_dirty": "Postgame/dirty â€” results tracking only, exclude from calibration",
+        }.get(value, value),
+        help="Use retro-clean when you are backfilling a past slate and rebuilt it with data that would have been available before tipoff. Retro-clean rows are allowed into calibration even though they were created after the game started.",
+    )
+    snapshot = build_snapshot(board, slate_date, snapshot_type_label)
     st.download_button(
         "Download pregame snapshot CSV", snapshot.to_csv(index=False).encode("utf-8"),
         file_name=f"wnba_props_snapshot_{slate_date}.csv", mime="text/csv", width="stretch",
@@ -2940,6 +2969,18 @@ with backtest_tab:
             st.session_state["wnba_history_errors"] = history_errors
             st.session_state["wnba_history_signature"] = signature
     history = normalize_history(st.session_state.get("wnba_history", pd.DataFrame()))
+    if not history.empty:
+        with st.expander("Retro-clean backfill controls", expanded=False):
+            st.caption("Use this only for past slates you rebuilt with the correct pregame setup, such as Slate Date = July 11 and Stats/Data Through = July 10. These rows remain marked after-start, but are included in clean calibration because SnapshotType is retro_clean.")
+            retro_candidates = history[history.get("SnapshotAfterStart", False).fillna(False) & ~history.get("RetroClean", False).fillna(False)]
+            st.write(f"Eligible after-start rows not yet retro-clean: {len(retro_candidates):,}")
+            if st.button("Mark after-start rows as retro-clean", width="stretch"):
+                mask = history.get("SnapshotAfterStart", False).fillna(False) & ~history.get("RetroClean", False).fillna(False)
+                history.loc[mask, "SnapshotType"] = "retro_clean"
+                history.loc[mask, "RetroClean"] = True
+                history = normalize_history(history)
+                st.session_state["wnba_history"] = history
+                st.success(f"Marked {int(mask.sum()):,} rows as retro-clean. Download the updated master history.")
     action1, action2 = st.columns(2)
     with action1:
         if st.button("Add current snapshot to session master", width="stretch"):
@@ -2958,15 +2999,17 @@ with backtest_tab:
         )
     summary = st.session_state.get("wnba_result_summary")
     if summary:
-        st.caption(f"Results matched: {summary.get('matched', 0)} · unmatched: {summary.get('unmatched', 0)}")
+        st.caption(f"Results matched: {summary.get('matched', 0)} Â· unmatched: {summary.get('unmatched', 0)}")
 
-    analysis = latest_pregame_history(history)
+    include_retro_clean = st.checkbox("Include retro-clean backfills in calibration", value=True, help="Keeps normal after-start snapshots excluded, but includes rows marked SnapshotType=retro_clean or RetroClean=True.")
+    analysis = latest_pregame_history(history, include_retro_clean=include_retro_clean)
     completed = analysis[analysis[[config["actual"] for config in TARGETS.values()]].notna().any(axis=1)].copy() if not analysis.empty else pd.DataFrame()
-    metrics = st.columns(4)
+    metrics = st.columns(5)
     metrics[0].metric("Master rows", f"{len(history):,}")
     metrics[1].metric("Analysis rows", f"{len(analysis):,}")
     metrics[2].metric("Completed outcomes", f"{len(completed):,}")
     metrics[3].metric("After-start rows", f"{int(history.get('SnapshotAfterStart', pd.Series(dtype=bool)).fillna(False).sum()):,}")
+    metrics[4].metric("Retro-clean rows", f"{int(history.get('RetroClean', pd.Series(dtype=bool)).fillna(False).sum()):,}")
 
     if not completed.empty:
         st.markdown("### Projection accuracy")
@@ -3002,7 +3045,7 @@ with backtest_tab:
             "slope": "{:.4f}", "intercept": "{:+.4f}", "raw_mae": "{:.3f}", "calibrated_mae": "{:.3f}",
             "holdout_raw_mae": "{:.3f}", "holdout_calibrated_mae": "{:.3f}",
         }), hide_index=True, width="stretch")
-        st.caption("Apply a target only when the chronological holdout MAE improves—not merely the full-sample MAE.")
+        st.caption("Apply a target only when the chronological holdout MAE improvesâ€”not merely the full-sample MAE.")
         if bundle.get("targets"):
             c1, c2 = st.columns(2)
             with c1:
@@ -3042,7 +3085,7 @@ with notes_tab:
         - **Projected minutes** is the central input. Review official injuries and edit minutes shortly before tipoff.
         - **Points, rebounds and assists** use blended season/recent per-minute production, projected minutes, pace and opponent allowances.
         - **PRA** is the sum of the three component projections; its uncertainty uses the player's historical PRA variation.
-        - **Target Score** is a 0–100 slate-relative comparison score, not a literal probability.
+        - **Target Score** is a 0â€“100 slate-relative comparison score, not a literal probability.
         - **Model Over probability** uses the projection and player-specific game-to-game variance with a continuity correction for integer lines.
         - **Prob Edge** compares model over probability with the no-vig market over probability.
         - **Confidence** reflects game/minute sample depth, not certainty that the prop will win.
