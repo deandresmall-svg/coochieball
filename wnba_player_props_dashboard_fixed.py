@@ -180,7 +180,7 @@ DEFAULT_STAT_SDS = {"Points": 5.5, "Rebounds": 2.7, "Assists": 2.2, "PRA": 7.5}
 # Presentation
 # -----------------------------------------------------------------------------
 
-st.set_page_config(page_title="WNBA Player Props Lab", page_icon="ðŸ€", layout="wide")
+st.set_page_config(page_title="WNBA Player Props Lab", page_icon="🏀", layout="wide")
 
 
 def inject_css() -> None:
@@ -1208,12 +1208,12 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
     if (/\d/.test(x)) return false;
     if (/^(WNBA|NBA|More|Less|Goblin|Demon|Discount|Fantasy Score|Projected|Search|Today|Tomorrow|Live|Popular|All|Board|Promo|Lineup)$/i.test(x)) return false;
     if (marketWords.some(w => x.toLowerCase() === w.toLowerCase())) return false;
-    return /^[A-Za-z .'â€™\-]+$/.test(x);
+    return /^[A-Za-z .'’\-]+$/.test(x);
   }
 
   function parseBlock(text, source="dom") {
     const raw = (text || "").replace(/\r/g, "\n");
-    const compactMatch = raw.match(new RegExp(`([A-Z][A-Za-z .'â€™\\-]{2,})\\s+(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i"));
+    const compactMatch = raw.match(new RegExp(`([A-Z][A-Za-z .'’\\-]{2,})\\s+(\\d+(?:\\.\\d+)?)\\s*(${marketAlternation})`, "i"));
     if (compactMatch) {
       addRow({ player: compactMatch[1], line: compactMatch[2], market: compactMatch[3], raw_text: raw.slice(0, 1200) }, source);
     }
@@ -1436,7 +1436,7 @@ PRIZEPICKS_EXPORT_SCRIPT = r'''
   await fetchObservedProjectionResources();
 
   const rawText = document.body.innerText || "";
-  rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'â€™\-]{2,}\b\s*\n)/g).forEach(block => parseBlock(block, "body_text"));
+  rawText.split(/\n\s*\n|(?=\b[A-Z][A-Za-z .'’\-]{2,}\b\s*\n)/g).forEach(block => parseBlock(block, "body_text"));
 
   const payload = {
     exported_at: new Date().toISOString(),
@@ -1559,7 +1559,7 @@ def _is_probable_player_name(value: Any) -> bool:
         return False
     if prizepicks_market_to_dashboard(text):
         return False
-    return bool(re.match(r"^[A-Za-z .'â€™\-]+$", text.strip()))
+    return bool(re.match(r"^[A-Za-z .'’\-]+$", text.strip()))
 
 
 def _parse_prizepicks_text_rows(text: str) -> list[dict[str, Any]]:
@@ -1752,9 +1752,9 @@ def _parse_prizepicks_plain_text(text: str) -> pd.DataFrame:
         line = re.sub(r"\s+", " ", raw_line).strip()
         if not line:
             continue
-        match = re.search(rf"(?P<player>[A-Za-z .'â€™\-]{{3,55}}?)\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<market>{market_terms})\b", line, flags=re.I)
+        match = re.search(rf"(?P<player>[A-Za-z .'’\-]{{3,55}}?)\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<market>{market_terms})\b", line, flags=re.I)
         if not match:
-            match = re.search(rf"(?P<player>[A-Za-z .'â€™\-]{{3,55}}?)\s+(?P<market>{market_terms})\b\s*(?P<val>\d+(?:\.\d+)?)", line, flags=re.I)
+            match = re.search(rf"(?P<player>[A-Za-z .'’\-]{{3,55}}?)\s+(?P<market>{market_terms})\b\s*(?P<val>\d+(?:\.\d+)?)", line, flags=re.I)
         if not match:
             continue
         player = re.sub(r"\b(More|Less|Goblin|Demon|Discount|WNBA)\b", "", match.group("player"), flags=re.I).strip(" -|")
@@ -2343,7 +2343,7 @@ def score_bucket_table(history: pd.DataFrame, target: str) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
     bins = [-0.001, 30, 45, 55, 70, 85, 100.001]
-    labels = ["0â€“29", "30â€“44", "45â€“54", "55â€“69", "70â€“84", "85â€“100"]
+    labels = ["0–29", "30–44", "45–54", "55–69", "70–84", "85–100"]
     frame["Score_Bucket"] = pd.cut(frame[config["score"]], bins=bins, labels=labels, right=False)
     if config["line"] in frame.columns:
         frame["Over"] = np.where(frame[config["line"]].notna(), frame[config["actual"]] > frame[config["line"]], np.nan)
@@ -2383,7 +2383,7 @@ def probability_calibration_table(records: pd.DataFrame) -> tuple[pd.DataFrame, 
     if records is None or records.empty:
         return pd.DataFrame(), np.nan
     bins = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 1.001]
-    labels = ["50â€“54%", "55â€“59%", "60â€“64%", "65â€“69%", "70â€“74%", "75%+"]
+    labels = ["50–54%", "55–59%", "60–64%", "65–69%", "70–74%", "75%+"]
     frame = records.copy()
     frame["Probability_Bucket"] = pd.cut(frame["Preferred_Probability"], bins=bins, labels=labels, right=False)
     grouped = frame.groupby("Probability_Bucket", observed=False).agg(
@@ -2475,7 +2475,7 @@ def manual_games_frame(slate_date: date, text: str) -> pd.DataFrame:
 
 inject_css()
 st.markdown('<div class="app-kicker">WNBA PLAYER PROPS LAB</div>', unsafe_allow_html=True)
-st.title("ðŸ€ WNBA Points Â· Rebounds Â· Assists Â· PRA")
+st.title("🏀 WNBA Points · Rebounds · Assists · PRA")
 st.caption("Minutes-driven projections, target-specific scores, prop-line comparison and built-in backtesting.")
 
 with st.sidebar:
@@ -2537,7 +2537,7 @@ if load_data or "wnba_player_logs_data" not in st.session_state:
             player_logs = read_uploaded_csv(player_csv, normalize_player_logs)
             team_logs = read_uploaded_csv(team_csv, normalize_team_logs)
         else:
-            with st.spinner("Loading WNBA game logs (official source, then automatic fallback)â€¦"):
+            with st.spinner("Loading WNBA game logs (official source, then automatic fallback)…"):
                 player_logs, team_logs, data_source = load_official_game_logs(season, season_type)
         if player_csv is not None and team_csv is not None:
             data_source = "Uploaded CSV files"
@@ -2552,7 +2552,7 @@ player_logs = st.session_state.get("wnba_player_logs_data", pd.DataFrame())
 team_logs = st.session_state.get("wnba_team_logs_data", pd.DataFrame())
 data_source = st.session_state.get("wnba_data_source", "")
 if data_source and not player_logs.empty:
-    st.success(f"WNBA data loaded from: {data_source} Â· {len(player_logs):,} player-game rows")
+    st.success(f"WNBA data loaded from: {data_source} · {len(player_logs):,} player-game rows")
 
 if load_schedule or "wnba_games" not in st.session_state:
     games, schedule_errors = fetch_official_schedule(slate_date)
@@ -2575,7 +2575,7 @@ with st.expander("Slate games and manual fallback", expanded=games.empty):
     errors = st.session_state.get("wnba_schedule_errors", [])
     if errors:
         st.caption("Schedule connection details: " + " | ".join(errors[:3]))
-    manual_text = st.text_area("Manual games â€” one per line, e.g. IND @ NYL", value="", height=100)
+    manual_text = st.text_area("Manual games — one per line, e.g. IND @ NYL", value="", height=100)
     if st.button("Use manual games"):
         manual = manual_games_frame(slate_date, manual_text)
         if manual.empty:
@@ -2596,7 +2596,7 @@ if build_board_button:
     if player_logs.empty or selected_game_frame.empty:
         st.warning("Load stats and select at least one game first.")
     else:
-        with st.spinner("Building minutes, rate and matchup projectionsâ€¦"):
+        with st.spinner("Building minutes, rate and matchup projections…"):
             raw_board = build_base_board(player_logs, team_logs, selected_game_frame)
             calibrated = apply_projection_calibration(raw_board, active_calibration)
             st.session_state["wnba_board"] = calibrated
@@ -2609,7 +2609,7 @@ if board.empty:
     st.stop()
 
 # Fetch/import props after board exists
-with st.expander("PrizePicks line import â€” screenshot/CSV workflow", expanded=False):
+with st.expander("PrizePicks line import — screenshot/CSV workflow", expanded=False):
     st.markdown(
         """
         Use this when APIs are stale or missing PrizePicks. No browser console or auto-scroll scripts are needed.
@@ -2794,7 +2794,7 @@ with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
                 st.error(f"SportsGameOdds prop fetch failed: {type(exc).__name__}: {exc}")
     meta = st.session_state.get("wnba_odds_meta", {})
     if meta:
-        st.caption("SportsGameOdds meta: " + " Â· ".join(f"{k}: {v}" for k, v in meta.items() if v))
+        st.caption("SportsGameOdds meta: " + " · ".join(f"{k}: {v}" for k, v in meta.items() if v))
     debug_fetch = st.session_state.get("wnba_sgo_fetch_debug", pd.DataFrame())
     if isinstance(debug_fetch, pd.DataFrame) and not debug_fetch.empty:
         with st.expander("SportsGameOdds fetch debug", expanded=False):
@@ -2949,9 +2949,9 @@ with backtest_tab:
         ["pregame_live", "retro_clean", "postgame_dirty"],
         index=0,
         format_func=lambda value: {
-            "pregame_live": "Pregame live â€” normal saved-before-tipoff slate",
-            "retro_clean": "Retro-clean backfill â€” recreated with only pregame data",
-            "postgame_dirty": "Postgame/dirty â€” results tracking only, exclude from calibration",
+            "pregame_live": "Pregame live — normal saved-before-tipoff slate",
+            "retro_clean": "Retro-clean backfill — recreated with only pregame data",
+            "postgame_dirty": "Postgame/dirty — results tracking only, exclude from calibration",
         }.get(value, value),
         help="Use retro-clean when you are backfilling a past slate and rebuilt it with data that would have been available before tipoff. Retro-clean rows are allowed into calibration even though they were created after the game started.",
     )
@@ -2999,7 +2999,7 @@ with backtest_tab:
         )
     summary = st.session_state.get("wnba_result_summary")
     if summary:
-        st.caption(f"Results matched: {summary.get('matched', 0)} Â· unmatched: {summary.get('unmatched', 0)}")
+        st.caption(f"Results matched: {summary.get('matched', 0)} · unmatched: {summary.get('unmatched', 0)}")
 
     include_retro_clean = st.checkbox("Include retro-clean backfills in calibration", value=True, help="Keeps normal after-start snapshots excluded, but includes rows marked SnapshotType=retro_clean or RetroClean=True.")
     analysis = latest_pregame_history(history, include_retro_clean=include_retro_clean)
@@ -3039,28 +3039,92 @@ with backtest_tab:
 
         st.markdown("### Fit target-specific projection calibration")
         min_rows = st.number_input("Minimum completed player-games", min_value=30, max_value=1000, value=75, step=25)
-        selected_fit_targets = st.multiselect("Targets to include if applied", list(TARGETS), default=[])
+
+        # First fit all targets so the dashboard can always show/download calibration candidates.
+        candidate_bundle, fit_table = make_calibration_bundle(completed, [], int(min_rows))
+        fit_table = fit_table.copy()
+        fit_table["holdout_improved"] = (
+            fit_table.get("ok", False).astype(bool)
+            & pd.to_numeric(fit_table.get("holdout_calibrated_mae"), errors="coerce").lt(
+                pd.to_numeric(fit_table.get("holdout_raw_mae"), errors="coerce")
+            )
+        )
+        recommended_targets = fit_table.loc[fit_table["holdout_improved"], "Target"].dropna().astype(str).tolist()
+
+        selected_fit_targets = st.multiselect(
+            "Targets to include if applied",
+            list(TARGETS),
+            default=recommended_targets,
+            help="Defaults to targets where chronological holdout MAE improved. You can override this before downloading/applying.",
+        )
         bundle, fit_table = make_calibration_bundle(completed, selected_fit_targets, int(min_rows))
+        fit_table = fit_table.copy()
+        fit_table["holdout_improved"] = (
+            fit_table.get("ok", False).astype(bool)
+            & pd.to_numeric(fit_table.get("holdout_calibrated_mae"), errors="coerce").lt(
+                pd.to_numeric(fit_table.get("holdout_raw_mae"), errors="coerce")
+            )
+        )
         st.dataframe(fit_table.style.format({
             "slope": "{:.4f}", "intercept": "{:+.4f}", "raw_mae": "{:.3f}", "calibrated_mae": "{:.3f}",
             "holdout_raw_mae": "{:.3f}", "holdout_calibrated_mae": "{:.3f}",
         }), hide_index=True, width="stretch")
-        st.caption("Apply a target only when the chronological holdout MAE improvesâ€”not merely the full-sample MAE.")
+        st.caption("Apply a target only when the chronological holdout MAE improves—not merely the full-sample MAE.")
+
+        # Always show download controls so the user can save the calibration/report even when no target is selected.
+        recommended_bundle, _ = make_calibration_bundle(completed, recommended_targets, int(min_rows))
+        report_payload = {
+            "version": MODEL_VERSION,
+            "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            "min_rows": int(min_rows),
+            "recommended_targets": recommended_targets,
+            "selected_targets": selected_fit_targets,
+            "selected_calibration": bundle,
+            "recommended_calibration": recommended_bundle,
+            "fit_table": fit_table.to_dict(orient="records"),
+        }
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button(
+                "Download selected calibration JSON",
+                json.dumps(bundle, indent=2).encode("utf-8"),
+                file_name="wnba_projection_calibration_selected.json",
+                mime="application/json",
+                width="stretch",
+                disabled=not bool(bundle.get("targets")),
+                help="Select one or more targets above to enable this file.",
+            )
+        with d2:
+            st.download_button(
+                "Download recommended calibration JSON",
+                json.dumps(recommended_bundle, indent=2).encode("utf-8"),
+                file_name="wnba_projection_calibration_recommended.json",
+                mime="application/json",
+                width="stretch",
+                disabled=not bool(recommended_bundle.get("targets")),
+                help="Includes only targets where chronological holdout MAE improved.",
+            )
+        with d3:
+            st.download_button(
+                "Download calibration report JSON",
+                json.dumps(report_payload, indent=2, default=str).encode("utf-8"),
+                file_name="wnba_projection_calibration_report.json",
+                mime="application/json",
+                width="stretch",
+                help="Always available. Includes the full fit table, selected targets, and recommended targets.",
+            )
+
         if bundle.get("targets"):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Download selected calibration JSON", json.dumps(bundle, indent=2).encode("utf-8"),
-                    file_name="wnba_projection_calibration.json", mime="application/json", width="stretch",
-                )
-            with c2:
-                if st.button("Apply selected calibration to current board", width="stretch"):
-                    st.session_state["wnba_projection_calibration"] = bundle
-                    base = st.session_state.get("wnba_base_board", board)
-                    calibrated = apply_projection_calibration(base, bundle)
-                    calibrated = apply_market_quotes(calibrated, odds, odds_source_mode)
-                    st.session_state["wnba_board"] = calibrated
-                    st.rerun()
+            if st.button("Apply selected calibration to current board", width="stretch"):
+                st.session_state["wnba_projection_calibration"] = bundle
+                base = st.session_state.get("wnba_base_board", board)
+                calibrated = apply_projection_calibration(base, bundle)
+                calibrated = apply_market_quotes(calibrated, odds, odds_source_mode)
+                st.session_state["wnba_board"] = calibrated
+                st.rerun()
+        else:
+            st.info("No selected targets are currently included in the calibration JSON. Select targets above or use the calibration report download for review.")
 
         st.markdown("### Segment checks")
         segment = st.selectbox("Break results down by", ["Confidence", "Role", "HomeAway", "Injury_Status"])
@@ -3085,7 +3149,7 @@ with notes_tab:
         - **Projected minutes** is the central input. Review official injuries and edit minutes shortly before tipoff.
         - **Points, rebounds and assists** use blended season/recent per-minute production, projected minutes, pace and opponent allowances.
         - **PRA** is the sum of the three component projections; its uncertainty uses the player's historical PRA variation.
-        - **Target Score** is a 0â€“100 slate-relative comparison score, not a literal probability.
+        - **Target Score** is a 0–100 slate-relative comparison score, not a literal probability.
         - **Model Over probability** uses the projection and player-specific game-to-game variance with a continuity correction for integer lines.
         - **Prob Edge** compares model over probability with the no-vig market over probability.
         - **Confidence** reflects game/minute sample depth, not certainty that the prop will win.
