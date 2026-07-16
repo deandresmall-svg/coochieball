@@ -2147,7 +2147,9 @@ with st.expander("Automatic The Odds API multi-book WNBA prop-line fetch", expan
                 if combined.empty:
                     st.warning("No selected-book player props were parsed from The Odds API. Open the debug table: if returned_bookmakers is blank, those books did not return props for that game/market; if discovery_returned_bookmakers has other books, The Odds API has props but not for your selected IDs.")
                 else:
-                    st.session_state["wnba_line_source_mode"] = odds_source_mode if odds_source_mode in LINE_SOURCE_OPTIONS else "Consensus sportsbooks"
+                    # Keep the user's existing selectbox choice. Streamlit does not allow
+                    # changing a widget-backed session-state key after that widget has
+                    # already been created during the current run.
                     returned_books = sorted(combined.get("Bookmaker", pd.Series(dtype=str)).dropna().astype(str).unique())
                     book_text = ", ".join(returned_books[:8]) + ("..." if len(returned_books) > 8 else "")
                     st.success(f"Fetched {len(combined):,} quote rows from The Odds API across {combined.get('BookmakerKey', pd.Series(dtype=str)).nunique()} books. Books: {book_text}")
