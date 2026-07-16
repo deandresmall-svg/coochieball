@@ -945,6 +945,104 @@ def fetch_the_odds_event_props(
 
 
 
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_the_odds_event_markets(
+    api_key: str,
+    sport_key: str,
+    event_id: str,
+    bookmaker_ids: tuple[str, ...] = (),
+    regions: str = "us,us2",
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Return available market keys by bookmaker for one The Odds API event."""
+    if not api_key or not event_id:
+        return pd.DataFrame(), {}
+    sport_key = str(sport_key or DEFAULT_THE_ODDS_SPORT_KEY).strip() or DEFAULT_THE_ODDS_SPORT_KEY
+    bookmakers = ",".join(str(x).strip().lower() for x in bookmaker_ids if str(x).strip())
+    params: dict[str, Any] = {"regions": regions, "dateFormat": "iso"}
+    if bookmakers:
+        params["bookmakers"] = bookmakers
+    response = _the_odds_request(api_key, f"/sports/{sport_key}/events/{event_id}/markets", params, timeout=30)
+    event = response.json()
+    rows: list[dict[str, Any]] = []
+    if isinstance(event, dict):
+        for bookmaker in event.get("bookmakers", []) or []:
+            if not isinstance(bookmaker, dict):
+                continue
+            book_key = str(bookmaker.get("key") or "").lower()
+            book_title = str(bookmaker.get("title") or BOOKMAKER_LABELS.get(book_key, book_key) or book_key)
+            market_keys = []
+            for market in bookmaker.get("markets", []) or []:
+                if isinstance(market, dict) and market.get("key"):
+                    market_keys.append(str(market.get("key")))
+            rows.append({
+                "TheOddsEventID": str(event_id),
+                "BookmakerKey": book_key,
+                "Bookmaker": book_title,
+                "MarketCount": len(market_keys),
+                "AvailableMarkets": ", ".join(sorted(set(market_keys))),
+                "HasPoints": "player_points" in set(market_keys),
+                "HasRebounds": "player_rebounds" in set(market_keys),
+                "HasAssists": "player_assists" in set(market_keys),
+                "HasPRA": "player_points_rebounds_assists" in set(market_keys),
+            })
+    meta = {
+        "provider": "The Odds API",
+        "endpoint": f"/sports/{sport_key}/events/{event_id}/markets",
+        "requested_bookmakers": bookmakers or "all returned books",
+        "regions": regions,
+        "rows": str(len(rows)),
+        "requests_remaining": response.headers.get("x-requests-remaining", ""),
+        "requests_used": response.headers.get("x-requests-used", ""),
+        "requests_last": response.headers.get("x-requests-last", ""),
+    }
+    return pd.DataFrame(rows), meta
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_the_odds_featured_odds_check(
+    api_key: str,
+    sport_key: str,
+    event_id: str,
+    regions: str = "us,us2",
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Small diagnostic to confirm the API key/sport/event can return normal markets."""
+    if not api_key or not event_id:
+        return pd.DataFrame(), {}
+    sport_key = str(sport_key or DEFAULT_THE_ODDS_SPORT_KEY).strip() or DEFAULT_THE_ODDS_SPORT_KEY
+    params = {
+        "regions": regions,
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    response = _the_odds_request(api_key, f"/sports/{sport_key}/events/{event_id}/odds", params, timeout=30)
+    event = response.json()
+    rows: list[dict[str, Any]] = []
+    if isinstance(event, dict):
+        for bookmaker in event.get("bookmakers", []) or []:
+            if not isinstance(bookmaker, dict):
+                continue
+            book_key = str(bookmaker.get("key") or "").lower()
+            book_title = str(bookmaker.get("title") or BOOKMAKER_LABELS.get(book_key, book_key) or book_key)
+            markets = [str(m.get("key")) for m in bookmaker.get("markets", []) or [] if isinstance(m, dict) and m.get("key")]
+            rows.append({
+                "TheOddsEventID": str(event_id),
+                "BookmakerKey": book_key,
+                "Bookmaker": book_title,
+                "FeaturedMarketsReturned": ", ".join(sorted(set(markets))),
+            })
+    meta = {
+        "provider": "The Odds API",
+        "endpoint": f"/sports/{sport_key}/events/{event_id}/odds featured check",
+        "rows": str(len(rows)),
+        "requests_remaining": response.headers.get("x-requests-remaining", ""),
+        "requests_used": response.headers.get("x-requests-used", ""),
+        "requests_last": response.headers.get("x-requests-last", ""),
+    }
+    return pd.DataFrame(rows), meta
+
 def _compact_bookmaker(value: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
@@ -1832,6 +1930,59 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
                 lookup[game] = event_id
         return lookup
 
+
+    if st.button("Check The Odds API available markets/bookmakers", width="stretch"):
+        if not the_odds_api_key:
+            st.error("Enter your temporary The Odds API key in the sidebar.")
+        else:
+            try:
+                manual_lookup = _manual_the_odds_id_lookup(manual_the_odds_ids)
+                if (not isinstance(odds_events, pd.DataFrame) or odds_events.empty) and not manual_lookup:
+                    odds_events, meta = fetch_the_odds_events(the_odds_api_key, the_odds_sport_key, slate_date)
+                    st.session_state["wnba_the_odds_events"] = odds_events
+                    st.session_state["wnba_odds_meta"] = meta
+                event_lookup = odds_events.set_index("Game")["TheOddsEventID"].astype(str).to_dict() if isinstance(odds_events, pd.DataFrame) and not odds_events.empty else {}
+                event_lookup.update(manual_lookup)
+                bookmaker_ids = tuple(v.strip().lower().replace(" ", "") for v in str(the_odds_bookmakers or "").split(",") if v.strip())
+                market_frames: list[pd.DataFrame] = []
+                featured_frames: list[pd.DataFrame] = []
+                missing_games: list[str] = []
+                last_meta: dict[str, str] = {"provider": "The Odds API"}
+                for game in the_odds_games:
+                    event_id = event_lookup.get(game)
+                    if not event_id:
+                        missing_games.append(game)
+                        continue
+                    all_markets, last_meta = fetch_the_odds_event_markets(the_odds_api_key, the_odds_sport_key, str(event_id), tuple(), regions=the_odds_regions)
+                    if not all_markets.empty:
+                        all_markets.insert(0, "Game", game)
+                    market_frames.append(all_markets)
+                    hardrock_markets, _ = fetch_the_odds_event_markets(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, regions=the_odds_regions)
+                    if not hardrock_markets.empty:
+                        hardrock_markets.insert(0, "Game", game)
+                        hardrock_markets["Scope"] = "Selected bookmaker IDs"
+                        market_frames.append(hardrock_markets)
+                    featured, _ = fetch_the_odds_featured_odds_check(the_odds_api_key, the_odds_sport_key, str(event_id), regions=the_odds_regions)
+                    if not featured.empty:
+                        featured.insert(0, "Game", game)
+                    featured_frames.append(featured)
+                market_debug = pd.concat(market_frames, ignore_index=True) if market_frames else pd.DataFrame()
+                featured_debug = pd.concat(featured_frames, ignore_index=True) if featured_frames else pd.DataFrame()
+                st.session_state["wnba_the_odds_market_debug"] = market_debug
+                st.session_state["wnba_the_odds_featured_debug"] = featured_debug
+                st.session_state["wnba_odds_meta"] = last_meta
+                if missing_games:
+                    st.warning("Missing The Odds API event IDs for: " + ", ".join(missing_games))
+                if market_debug.empty and featured_debug.empty:
+                    st.warning("The Odds API returned no available markets and no featured odds for the selected events. This points to sport/date/event coverage or account access, not player-name matching.")
+                elif not market_debug.empty and not market_debug[[c for c in ["HasPoints", "HasRebounds", "HasAssists", "HasPRA"] if c in market_debug.columns]].any().any():
+                    st.warning("The Odds API returned bookmakers/markets, but none of the WNBA player prop markets are available for these events. Use PrizePicks/CSV import for this slate.")
+                else:
+                    st.success("Market diagnostic complete. Open the market debug tables below.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"The Odds API market diagnostic failed: {type(exc).__name__}: {exc}")
+
     if st.button("Fetch Hard Rock WNBA prop lines from The Odds API", width="stretch"):
         if not the_odds_api_key:
             st.error("Enter your temporary The Odds API key in the sidebar.")
@@ -1902,6 +2053,15 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
     if isinstance(the_odds_debug_fetch, pd.DataFrame) and not the_odds_debug_fetch.empty:
         with st.expander("The Odds API fetch debug", expanded=False):
             st.dataframe(the_odds_debug_fetch, hide_index=True, width="stretch")
+
+    the_odds_market_debug = st.session_state.get("wnba_the_odds_market_debug", pd.DataFrame())
+    if isinstance(the_odds_market_debug, pd.DataFrame) and not the_odds_market_debug.empty:
+        with st.expander("The Odds API available markets debug", expanded=False):
+            st.dataframe(the_odds_market_debug, hide_index=True, width="stretch")
+    the_odds_featured_debug = st.session_state.get("wnba_the_odds_featured_debug", pd.DataFrame())
+    if isinstance(the_odds_featured_debug, pd.DataFrame) and not the_odds_featured_debug.empty:
+        with st.expander("The Odds API featured odds diagnostic", expanded=False):
+            st.dataframe(the_odds_featured_debug, hide_index=True, width="stretch")
 
 
 odds = st.session_state.get("wnba_odds", pd.DataFrame())
