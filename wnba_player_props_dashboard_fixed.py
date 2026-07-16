@@ -859,7 +859,8 @@ def fetch_the_odds_event_props(
     event_id: str,
     bookmaker_ids: tuple[str, ...] = ("hardrockbet_fl", "hardrockbet"),
     markets: tuple[str, ...] = ("player_points", "player_rebounds", "player_assists", "player_points_rebounds_assists"),
-    regions: str = "us2",
+    regions: str = "us,us2",
+    discover_all_books: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     """Fetch and parse player prop quote rows for one The Odds API event."""
     if not api_key or not event_id:
@@ -868,11 +869,15 @@ def fetch_the_odds_event_props(
     bookmakers = ",".join(str(x).strip().lower() for x in bookmaker_ids if str(x).strip())
     params: dict[str, Any] = {
         "regions": regions,
-        "bookmakers": bookmakers,
         "markets": ",".join(markets),
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
+    # The Odds API ignores regions when bookmakers is supplied. Keep bookmakers for the
+    # normal Hard Rock pull, but allow a discovery mode with no bookmaker filter so the
+    # debug table can show which books/markets The Odds API actually returned.
+    if bookmakers and not discover_all_books:
+        params["bookmakers"] = bookmakers
     response = _the_odds_request(api_key, f"/sports/{sport_key}/events/{event_id}/odds", params, timeout=35)
     event = response.json()
     rows: list[dict[str, Any]] = []
@@ -927,7 +932,8 @@ def fetch_the_odds_event_props(
     meta = {
         "provider": "The Odds API",
         "endpoint": f"/sports/{sport_key}/events/{event_id}/odds",
-        "requested_bookmakers": bookmakers,
+        "requested_bookmakers": bookmakers if not discover_all_books else "DISCOVERY: all returned books",
+        "regions": regions,
         "returned_bookmakers": ", ".join(sorted(raw_bookmakers)),
         "raw_markets": ", ".join(sorted(raw_market_labels)),
         "parsed_quote_rows": str(len(rows)),
@@ -936,6 +942,55 @@ def fetch_the_odds_event_props(
         "requests_last": response.headers.get("x-requests-last", ""),
     }
     return pd.DataFrame(rows), meta
+
+
+
+def _compact_bookmaker(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def combine_odds_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    valid = [frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not valid:
+        return pd.DataFrame()
+    combined = pd.concat(valid, ignore_index=True)
+    required = ["EventID", "BookmakerKey", "Market", "NameKey", "Side", "Line"]
+    for col in required:
+        if col not in combined.columns:
+            combined[col] = "" if col != "Line" else np.nan
+    return combined.drop_duplicates(required, keep="last")
+
+
+def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]:
+    if group is None or group.empty:
+        return {}
+    data = group.copy()
+    source_mode = str(source_mode or "Consensus")
+    if source_mode != "Consensus":
+        label_match = data["Bookmaker"].map(lambda value: bookmaker_matches_source(value, source_mode)) if "Bookmaker" in data.columns else pd.Series(False, index=data.index)
+        id_match = data["BookmakerKey"].map(lambda value: bookmaker_matches_source(value, source_mode)) if "BookmakerKey" in data.columns else pd.Series(False, index=data.index)
+        data = data[label_match | id_match]
+        if data.empty:
+            return {}
+    lines = pd.to_numeric(data.get("Line", pd.Series(dtype=float)), errors="coerce").dropna()
+    if lines.empty:
+        return {}
+    # If multiple books are used, choose the median line. For one book, this is that book's line.
+    target_line = float(lines.median())
+    numeric_line = pd.to_numeric(data["Line"], errors="coerce")
+    near = data[np.isclose(numeric_line, target_line, atol=0.01)].copy()
+    over_prices = pd.to_numeric(near.loc[near["Side"].astype(str).str.lower().eq("over"), "Odds"], errors="coerce").dropna() if "Odds" in near.columns else pd.Series(dtype=float)
+    under_prices = pd.to_numeric(near.loc[near["Side"].astype(str).str.lower().eq("under"), "Odds"], errors="coerce").dropna() if "Odds" in near.columns else pd.Series(dtype=float)
+    over_odds = float(over_prices.median()) if not over_prices.empty else np.nan
+    under_odds = float(under_prices.median()) if not under_prices.empty else np.nan
+    books = sorted(near.get("Bookmaker", pd.Series(dtype=str)).dropna().astype(str).unique())
+    return {
+        "Line": target_line,
+        "OverOdds": over_odds,
+        "UnderOdds": under_odds,
+        "MarketOverProb": no_vig_over_probability(over_odds, under_odds),
+        "Source": source_mode if source_mode != "Consensus" else f"Consensus ({len(books)} books)",
+    }
 
 
 def bookmaker_matches_source(value: Any, source_mode: str) -> bool:
@@ -1551,11 +1606,15 @@ with st.sidebar:
     st.divider()
     st.subheader("Automatic prop lines")
     the_odds_api_key = st.text_input("The Odds API key (session only)", type="password")
+    default_line_source = st.session_state.get("wnba_line_source_mode", "PrizePicks")
+    if default_line_source not in LINE_SOURCE_OPTIONS:
+        default_line_source = "PrizePicks" if "PrizePicks" in LINE_SOURCE_OPTIONS else LINE_SOURCE_OPTIONS[0]
     odds_source_mode = st.selectbox(
         "Line source",
         LINE_SOURCE_OPTIONS,
-        index=LINE_SOURCE_OPTIONS.index("PrizePicks") if "PrizePicks" in LINE_SOURCE_OPTIONS else 0,
-        help="Choose Consensus or a specific provider. Pick PrizePicks if you only want PrizePicks lines on the board.",
+        index=LINE_SOURCE_OPTIONS.index(default_line_source),
+        key="wnba_line_source_mode",
+        help="Choose Consensus or a specific provider. Select Hard Rock Bet after fetching Hard Rock lines from The Odds API.",
     )
     if st.button("Clear cached data", width="stretch"):
         st.cache_data.clear()
@@ -1727,8 +1786,10 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
     st.caption("Uses The Odds API event-odds endpoint. The app fetches WNBA player prop markets one event at a time and locally matches Hard Rock Bet lines to your projection board.")
     st.info("For Hard Rock in Florida, use bookmaker ID hardrockbet_fl first. The fallback hardrockbet ID is included too.")
     the_odds_sport_key = st.text_input("The Odds API sport key", value=DEFAULT_THE_ODDS_SPORT_KEY, help="Usually basketball_wnba. If your account uses a different WNBA sport key, enter it here.")
-    the_odds_bookmakers = st.text_input("The Odds API bookmaker IDs", value="hardrockbet_fl,hardrockbet", help="Comma-separated bookmaker keys. Hard Rock FL is hardrockbet_fl.")
+    the_odds_bookmakers = st.text_input("The Odds API bookmaker IDs", value="hardrockbet_fl,hardrockbet", help="Comma-separated bookmaker keys. Hard Rock FL is usually hardrockbet_fl. If no lines return, use discovery mode below to see what books The Odds API returned.")
+    the_odds_regions = st.text_input("The Odds API regions for discovery", value="us,us2", help="Only used in discovery mode; bookmaker-specific fetches ignore regions per The Odds API rules.")
     the_odds_markets = st.multiselect("Markets to fetch from The Odds API", list(TARGETS), default=list(TARGETS))
+    discover_the_odds_books = st.checkbox("Debug/discovery: also check all returned bookmakers if Hard Rock returns no rows", value=True)
     the_odds_games = st.multiselect("Games to query from The Odds API", board["Game"].drop_duplicates().tolist(), default=board["Game"].drop_duplicates().tolist())
     if st.button("Find The Odds API WNBA event IDs", width="stretch"):
         if not the_odds_api_key:
@@ -1797,8 +1858,18 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
                     if not event_id:
                         missing_games.append(game)
                         continue
-                    frame, last_meta = fetch_the_odds_event_props(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, wanted_markets)
-                    debug_rows.append({"Game": game, "TheOddsEventID": str(event_id), **last_meta})
+                    frame, last_meta = fetch_the_odds_event_props(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, wanted_markets, regions=the_odds_regions, discover_all_books=False)
+                    debug_row = {"Game": game, "TheOddsEventID": str(event_id), **last_meta}
+                    # If Hard Rock returns nothing, optionally do a no-bookmaker-filter request
+                    # only for debugging so you can see whether The Odds API has any props at all.
+                    if (frame is None or frame.empty) and discover_the_odds_books:
+                        discovery_frame, discovery_meta = fetch_the_odds_event_props(the_odds_api_key, the_odds_sport_key, str(event_id), tuple(), wanted_markets, regions=the_odds_regions, discover_all_books=True)
+                        debug_row.update({
+                            "discovery_returned_bookmakers": discovery_meta.get("returned_bookmakers", ""),
+                            "discovery_raw_markets": discovery_meta.get("raw_markets", ""),
+                            "discovery_parsed_quote_rows": discovery_meta.get("parsed_quote_rows", ""),
+                        })
+                    debug_rows.append(debug_row)
                     if frame is not None and not frame.empty:
                         board_event_ids = board.loc[board["Game"].eq(game), "EventID"].dropna().astype(str).unique()
                         if len(board_event_ids):
@@ -1817,9 +1888,10 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
                 if missing_games:
                     st.warning("Missing The Odds API event IDs for: " + ", ".join(missing_games))
                 if combined.empty:
-                    st.warning("No matching Hard Rock player props were parsed from The Odds API. Try hardrockbet_fl,hardrockbet, confirm WNBA props are available, and check the debug table below.")
+                    st.warning("No Hard Rock player props were parsed from The Odds API. Open the debug table: if returned_bookmakers is blank, Hard Rock did not return props for that game/market; if discovery_returned_bookmakers has other books, The Odds API has props but not Hard Rock for your selected IDs.")
                 else:
-                    st.success(f"Fetched {len(combined):,} quote rows from The Odds API.")
+                    st.session_state["wnba_line_source_mode"] = "Hard Rock Bet"
+                    st.success(f"Fetched {len(combined):,} Hard Rock quote rows from The Odds API. Line source switched to Hard Rock Bet.")
                 st.rerun()
             except Exception as exc:
                 st.error(f"The Odds API prop fetch failed: {type(exc).__name__}: {exc}")
@@ -1861,6 +1933,24 @@ leaders[4].metric("Players modeled", f"{len(board):,}", f"{board['Game'].nunique
 ])
 
 
+def safe_styled_dataframe(view: pd.DataFrame, format_map: dict | None = None, gradient_cols: list[str] | None = None, height: int = 650) -> None:
+    """Display a dataframe without crashing if matplotlib is unavailable on Streamlit Cloud."""
+    format_map = format_map or {}
+    gradient_cols = [c for c in (gradient_cols or []) if c in view.columns]
+    try:
+        styled = view.style
+        if gradient_cols:
+            styled = styled.background_gradient(cmap="RdYlGn", subset=gradient_cols, axis=0)
+        styled = styled.format(format_map)
+        st.dataframe(styled, hide_index=True, width="stretch", height=height)
+    except ImportError:
+        # pandas Styler.background_gradient requires matplotlib. If it is missing, show the table normally.
+        st.dataframe(view, hide_index=True, width="stretch", height=height)
+    except Exception:
+        # Keep the dashboard alive if styling fails for any reason.
+        st.dataframe(view, hide_index=True, width="stretch", height=height)
+
+
 def render_target_table(target: str) -> None:
     config = TARGETS[target]
     columns = [
@@ -1877,14 +1967,11 @@ def render_target_table(target: str) -> None:
     }
     view = view.rename(columns=rename)
     style_cols = [c for c in [f"Proj {target}", "Target Score", "Model Over", "Prob Edge"] if c in view.columns]
-    style = view.style
-    if style_cols:
-        style = style.background_gradient(cmap="RdYlGn", subset=style_cols, axis=0)
-    st.dataframe(style.format({
+    safe_styled_dataframe(view, {
         "Proj Min": "{:.1f}", f"Proj {target}": "{:.2f}", "Target Score": "{:.1f}", "SD": "{:.2f}",
         "Line": "{:.1f}", "Model Over": "{:.1%}", "Market Over": "{:.1%}",
         "Prob Edge": "{:+.1%}", "Projection Edge": "{:+.2f}",
-    }), hide_index=True, width="stretch", height=650)
+    }, style_cols, height=650)
 
 
 with board_tab:
@@ -1899,11 +1986,14 @@ with board_tab:
         "PRA_Score": "PRA Score", "Overall_Score": "Overall", "Injury_Status": "Status",
     })
     gradient = ["PTS", "REB", "AST", "PRA", "PTS Score", "REB Score", "AST Score", "PRA Score", "Overall"]
-    st.dataframe(
-        view.style.background_gradient(cmap="RdYlGn", subset=[c for c in gradient if c in view.columns], axis=0).format({
+    safe_styled_dataframe(
+        view,
+        {
             "Proj Min": "{:.1f}", "PTS": "{:.2f}", "REB": "{:.2f}", "AST": "{:.2f}", "PRA": "{:.2f}",
             "PTS Score": "{:.1f}", "REB Score": "{:.1f}", "AST Score": "{:.1f}", "PRA Score": "{:.1f}", "Overall": "{:.1f}",
-        }), hide_index=True, width="stretch", height=680,
+        },
+        [c for c in gradient if c in view.columns],
+        height=680,
     )
     st.caption("Heatmap text color is automatic contrast only; it is not an additional signal.")
 
