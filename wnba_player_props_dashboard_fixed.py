@@ -5,7 +5,7 @@ WNBA Player Props Lab
 
 A standalone Streamlit dashboard for WNBA points, rebounds, assists and PRA.
 Primary data source: official WNBA Stats endpoints (LeagueID 10).
-Optional market sources: PrizePicks import, SportsGameOdds, and The Odds API.
+Optional market sources: PrizePicks import, and The Odds API.
 
 Install:
     pip install streamlit pandas numpy requests pillow pytesseract
@@ -40,7 +40,6 @@ WNBA_STATS_BASE = "https://stats.wnba.com/stats"
 WNBA_STATS_BASES = ["https://stats.wnba.com/stats", "https://stats.nba.com/stats"]
 ESPN_WNBA_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
 EASTERN_TZ = ZoneInfo("America/New_York")
-SPORTSGAMEODDS_API_BASE = "https://api.sportsgameodds.com/v2"
 THE_ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 DEFAULT_THE_ODDS_SPORT_KEY = "basketball_wnba"
 
