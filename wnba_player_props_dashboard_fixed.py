@@ -5,7 +5,7 @@ WNBA Player Props Lab
 
 A standalone Streamlit dashboard for WNBA points, rebounds, assists and PRA.
 Primary data source: official WNBA Stats endpoints (LeagueID 10).
-Optional market source: SportsGameOdds WNBA API.
+Optional market sources: PrizePicks import, SportsGameOdds, and The Odds API.
 
 Install:
     pip install streamlit pandas numpy requests pillow pytesseract
@@ -41,6 +41,8 @@ WNBA_STATS_BASES = ["https://stats.wnba.com/stats", "https://stats.nba.com/stats
 ESPN_WNBA_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
 EASTERN_TZ = ZoneInfo("America/New_York")
 SPORTSGAMEODDS_API_BASE = "https://api.sportsgameodds.com/v2"
+THE_ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+DEFAULT_THE_ODDS_SPORT_KEY = "basketball_wnba"
 
 TARGETS: dict[str, dict[str, str]] = {
     "Points": {
@@ -129,6 +131,9 @@ TEAM_NAMES = {
 
 BOOKMAKER_LABELS = {
     "hardrockbet": "Hard Rock Bet",
+    "hardrockbet_fl": "Hard Rock Bet FL",
+    "hardrockbet_az": "Hard Rock Bet AZ",
+    "hardrockbet_oh": "Hard Rock Bet OH",
     "hard_rock_bet": "Hard Rock Bet",
     "fanduel": "FanDuel",
     "fan_duel": "FanDuel",
@@ -163,7 +168,7 @@ LINE_SOURCE_OPTIONS = [
 
 LINE_SOURCE_DEFAULT_BOOKMAKER_IDS = {
     "PrizePicks": ("prizepicks",),
-    "Hard Rock Bet": ("hardrockbet",),
+    "Hard Rock Bet": ("hardrockbet_fl", "hardrockbet", "hardrockbet_az", "hardrockbet_oh"),
     "FanDuel": ("fanduel",),
     "DraftKings": ("draftkings",),
     "BetMGM": ("betmgm",),
@@ -1871,10 +1876,9 @@ def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]
         return {}
     data = group.copy()
     if source_mode != "Consensus":
-        wanted = _compact_bookmaker(source_mode)
-        bookmaker_label_key = data["Bookmaker"].map(_compact_bookmaker) if "Bookmaker" in data.columns else pd.Series([], dtype=str)
-        bookmaker_id_key = data["BookmakerKey"].map(_compact_bookmaker) if "BookmakerKey" in data.columns else pd.Series([], dtype=str)
-        data = data[(bookmaker_label_key.eq(wanted)) | (bookmaker_id_key.eq(wanted))]
+        label_match = data["Bookmaker"].map(lambda value: bookmaker_matches_source(value, source_mode)) if "Bookmaker" in data.columns else pd.Series(False, index=data.index)
+        id_match = data["BookmakerKey"].map(lambda value: bookmaker_matches_source(value, source_mode)) if "BookmakerKey" in data.columns else pd.Series(False, index=data.index)
+        data = data[label_match | id_match]
         if data.empty:
             return {}
     lines = pd.to_numeric(data["Line"], errors="coerce").dropna()
@@ -1892,8 +1896,177 @@ def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]
         "OverOdds": over_odds,
         "UnderOdds": under_odds,
         "MarketOverProb": no_vig_over_probability(over_odds, under_odds),
-        "Source": source_mode if source_mode != "Consensus" else f"SportsGameOdds consensus ({len(books)} books)",
+        "Source": source_mode if source_mode != "Consensus" else f"Consensus ({len(books)} books)",
     }
+
+
+
+# -----------------------------------------------------------------------------
+# The Odds API WNBA player prop-line API
+# -----------------------------------------------------------------------------
+
+
+def _the_odds_request(api_key: str, path: str, params: dict[str, Any] | None = None, timeout: int = 30) -> requests.Response:
+    url = f"{THE_ODDS_API_BASE}{path}"
+    clean_params = {k: v for k, v in (params or {}).items() if v not in [None, "", [], ()]}
+    clean_params["apiKey"] = str(api_key or "").strip()
+    response = requests.get(url, params=clean_params, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def _team_candidates_from_event(event: dict[str, Any]) -> tuple[str, str]:
+    away = normalize_team(event.get("away_team") or event.get("awayTeam") or event.get("away"))
+    home = normalize_team(event.get("home_team") or event.get("homeTeam") or event.get("home"))
+    return away, home
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_the_odds_events(api_key: str, sport_key: str, slate_date: date) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Fetch WNBA event IDs from The Odds API for a slate date."""
+    if not api_key:
+        return pd.DataFrame(), {}
+    sport_key = str(sport_key or DEFAULT_THE_ODDS_SPORT_KEY).strip() or DEFAULT_THE_ODDS_SPORT_KEY
+    # Wide UTC window handles U.S. evening games and date rollover.
+    start_dt = datetime.combine(slate_date, datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    end_dt = datetime.combine(slate_date + timedelta(days=2), datetime.min.time(), tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    params = {
+        "dateFormat": "iso",
+        "commenceTimeFrom": start_dt,
+        "commenceTimeTo": end_dt,
+    }
+    response = _the_odds_request(api_key, f"/sports/{sport_key}/events", params, timeout=30)
+    events = response.json()
+    if not isinstance(events, list):
+        events = []
+    rows: list[dict[str, Any]] = []
+    debug_rows: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        away, home = _team_candidates_from_event(event)
+        game = f"{away} @ {home}" if away and home else ""
+        row = {
+            "Game": game,
+            "TheOddsEventID": str(event.get("id") or ""),
+            "GameTimeUTC": str(event.get("commence_time") or ""),
+            "AwayTeam": away,
+            "HomeTeam": home,
+            "AwayName": str(event.get("away_team") or ""),
+            "HomeName": str(event.get("home_team") or ""),
+            "Source": "The Odds API",
+        }
+        if game and row["TheOddsEventID"]:
+            rows.append(row)
+        debug_rows.append(row)
+    st.session_state["wnba_the_odds_event_debug"] = pd.DataFrame(debug_rows)
+    frame = pd.DataFrame(rows).drop_duplicates(["TheOddsEventID"]) if rows else pd.DataFrame()
+    meta = {
+        "provider": "The Odds API",
+        "endpoint": f"/sports/{sport_key}/events",
+        "raw_events": str(len(events)),
+        "parsed_events": str(len(frame)),
+        "requests_remaining": response.headers.get("x-requests-remaining", ""),
+        "requests_used": response.headers.get("x-requests-used", ""),
+        "requests_last": response.headers.get("x-requests-last", ""),
+    }
+    return frame, meta
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_the_odds_event_props(
+    api_key: str,
+    sport_key: str,
+    event_id: str,
+    bookmaker_ids: tuple[str, ...] = ("hardrockbet_fl", "hardrockbet"),
+    markets: tuple[str, ...] = ("player_points", "player_rebounds", "player_assists", "player_points_rebounds_assists"),
+    regions: str = "us2",
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Fetch and parse player prop quote rows for one The Odds API event."""
+    if not api_key or not event_id:
+        return pd.DataFrame(), {}
+    sport_key = str(sport_key or DEFAULT_THE_ODDS_SPORT_KEY).strip() or DEFAULT_THE_ODDS_SPORT_KEY
+    bookmakers = ",".join(str(x).strip().lower() for x in bookmaker_ids if str(x).strip())
+    params: dict[str, Any] = {
+        "regions": regions,
+        "bookmakers": bookmakers,
+        "markets": ",".join(markets),
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    response = _the_odds_request(api_key, f"/sports/{sport_key}/events/{event_id}/odds", params, timeout=35)
+    event = response.json()
+    rows: list[dict[str, Any]] = []
+    raw_market_labels: set[str] = set()
+    raw_bookmakers: set[str] = set()
+    if isinstance(event, dict):
+        bookmakers_payload = event.get("bookmakers", []) or []
+    else:
+        bookmakers_payload = []
+    for bookmaker in bookmakers_payload:
+        if not isinstance(bookmaker, dict):
+            continue
+        book_key = str(bookmaker.get("key") or "").lower().replace(" ", "_").replace("-", "_")
+        book_label = str(bookmaker.get("title") or BOOKMAKER_LABELS.get(book_key, book_key) or book_key)
+        raw_bookmakers.add(book_key)
+        for market in bookmaker.get("markets", []) or []:
+            if not isinstance(market, dict):
+                continue
+            market_key = str(market.get("key") or "")
+            raw_market_labels.add(market_key)
+            if market_key not in {config["market"] for config in TARGETS.values()}:
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                if not isinstance(outcome, dict):
+                    continue
+                side = str(outcome.get("name") or "").title()
+                if side.lower() not in {"over", "under"}:
+                    continue
+                player_name = str(outcome.get("description") or outcome.get("participant") or outcome.get("player") or "").strip()
+                if not player_name:
+                    continue
+                line = pd.to_numeric(pd.Series([outcome.get("point")]), errors="coerce").iloc[0]
+                price = pd.to_numeric(pd.Series([outcome.get("price")]), errors="coerce").iloc[0]
+                if pd.isna(line):
+                    continue
+                rows.append({
+                    "EventID": str(event_id),
+                    "TheOddsEventID": str(event_id),
+                    "Bookmaker": book_label,
+                    "BookmakerKey": book_key,
+                    "Market": market_key,
+                    "Player": player_name,
+                    "NameKey": normalize_player_name(player_name),
+                    "Side": side,
+                    "Line": float(line),
+                    "Odds": price if pd.notna(price) else np.nan,
+                    "Updated": str(market.get("last_update") or bookmaker.get("last_update") or ""),
+                    "MarketType": "ou",
+                    "Source": "The Odds API",
+                    "OddID": f"{book_key}:{market_key}:{player_name}:{side}:{line}",
+                })
+    meta = {
+        "provider": "The Odds API",
+        "endpoint": f"/sports/{sport_key}/events/{event_id}/odds",
+        "requested_bookmakers": bookmakers,
+        "returned_bookmakers": ", ".join(sorted(raw_bookmakers)),
+        "raw_markets": ", ".join(sorted(raw_market_labels)),
+        "parsed_quote_rows": str(len(rows)),
+        "requests_remaining": response.headers.get("x-requests-remaining", ""),
+        "requests_used": response.headers.get("x-requests-used", ""),
+        "requests_last": response.headers.get("x-requests-last", ""),
+    }
+    return pd.DataFrame(rows), meta
+
+
+def bookmaker_matches_source(value: Any, source_mode: str) -> bool:
+    wanted = _compact_bookmaker(source_mode)
+    candidate = _compact_bookmaker(value)
+    if not wanted:
+        return True
+    if wanted == "hardrockbet":
+        return candidate.startswith("hardrockbet") or candidate == "hardrock"
+    return candidate == wanted or candidate.startswith(wanted)
 
 
 # -----------------------------------------------------------------------------
@@ -2207,12 +2380,11 @@ def build_snapshot(board: pd.DataFrame, slate_date: date, snapshot_type: str = "
     snapshot["GeneratedAtUTC"] = pd.Timestamp.now(tz="UTC").isoformat()
     snapshot["ModelVersion"] = MODEL_VERSION
     snapshot["SnapshotType"] = snapshot_type
-    snapshot["RetroClean"] = str(snapshot_type).lower().replace("-", "_") == "retro_clean"
     for target, config in TARGETS.items():
         snapshot[config["actual"]] = np.nan
     snapshot["ResultStatus"] = ""
     preferred = [
-        "SlateDate", "GameTimeUTC", "GeneratedAtUTC", "ModelVersion", "SnapshotType", "RetroClean", "EventID", "PlayerID", "Player",
+        "SlateDate", "GameTimeUTC", "GeneratedAtUTC", "ModelVersion", "SnapshotType", "EventID", "PlayerID", "Player",
         "Team", "Opponent", "HomeAway", "Game", "Games", "Avg_MIN", "Proj_MIN", "Manual_MIN",
         "Usage_Adjustment", "Injury_Status", "Role", "Confidence", "Calibration_Applied", "Calibration_Targets",
     ]
@@ -2245,18 +2417,16 @@ def normalize_history(history: pd.DataFrame) -> pd.DataFrame:
             if column not in result.columns:
                 result[column] = np.nan
             result[column] = pd.to_numeric(result[column], errors="coerce")
-    if "SnapshotType" not in result.columns:
-        result["SnapshotType"] = "pregame_live"
-    result["SnapshotType"] = result["SnapshotType"].fillna("pregame_live").astype(str).str.lower().str.replace("-", "_", regex=False).str.replace(" ", "_", regex=False)
-    if "RetroClean" not in result.columns:
-        result["RetroClean"] = False
-    result["RetroClean"] = result["RetroClean"].map(lambda value: str(value).strip().lower() in {"true", "1", "yes", "y", "retro_clean"})
-    result.loc[result["SnapshotType"].eq("retro_clean"), "RetroClean"] = True
     result["SnapshotAfterStart"] = (
         result["GeneratedAtUTC"].notna() & result["GameTimeUTC"].notna()
         & result["GeneratedAtUTC"].gt(result["GameTimeUTC"])
     )
-    result["CleanForCalibration"] = (~result["SnapshotAfterStart"].fillna(False)) | result["RetroClean"].fillna(False)
+    if "SnapshotType" not in result.columns:
+        result["SnapshotType"] = ""
+    result["SnapshotType"] = result["SnapshotType"].fillna("").astype(str)
+    snapshot_type_key = result["SnapshotType"].str.lower().str.replace(r"[^a-z0-9]+", "_", regex=True).str.strip("_")
+    result["SnapshotRetroClean"] = snapshot_type_key.isin({"retro_clean", "retroclean", "backfill", "backfilled", "historical_backfill"})
+    result["CleanForAnalysis"] = (~result["SnapshotAfterStart"].fillna(False)) | result["SnapshotRetroClean"].fillna(False)
     if "ResultStatus" not in result.columns:
         result["ResultStatus"] = ""
     return result
@@ -2304,16 +2474,12 @@ def latest_pregame_history(history: pd.DataFrame, include_retro_clean: bool = Tr
     if frame.empty:
         return frame
     if include_retro_clean:
-        frame = frame[frame["CleanForCalibration"].fillna(False)].copy()
+        clean_mask = frame["CleanForAnalysis"].fillna(False)
     else:
-        frame = frame[~frame["SnapshotAfterStart"].fillna(False)].copy()
+        clean_mask = ~frame["SnapshotAfterStart"].fillna(False)
+    frame = frame[clean_mask].copy()
     frame = frame.sort_values(["SlateDate", "GeneratedAtUTC"], na_position="last")
-    dedupe_cols = [c for c in ["SlateDate", "EventID", "PlayerID"] if c in frame.columns]
-    if len(dedupe_cols) < 3 and "Game" in frame.columns:
-        dedupe_cols = [c for c in ["SlateDate", "Game", "PlayerID"] if c in frame.columns]
-    if dedupe_cols:
-        return frame.drop_duplicates(dedupe_cols, keep="last")
-    return frame
+    return frame.drop_duplicates(["SlateDate", "EventID", "PlayerID"], keep="last")
 
 
 def projection_metrics(history: pd.DataFrame, target: str) -> dict[str, float]:
@@ -2506,6 +2672,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Automatic prop lines")
     sgo_api_key = st.text_input("SportsGameOdds API key (session only)", type="password")
+    the_odds_api_key = st.text_input("The Odds API key (session only)", type="password")
     odds_source_mode = st.selectbox(
         "Line source",
         LINE_SOURCE_OPTIONS,
@@ -2520,7 +2687,7 @@ with st.sidebar:
 
     if st.button("Clear cached data", width="stretch"):
         st.cache_data.clear()
-        for key in ["wnba_board", "wnba_games", "wnba_odds", "wnba_player_logs_data", "wnba_team_logs_data", "wnba_data_source", "wnba_sgo_events"]:
+        for key in ["wnba_board", "wnba_games", "wnba_odds", "wnba_player_logs_data", "wnba_team_logs_data", "wnba_data_source", "wnba_sgo_events", "wnba_the_odds_events"]:
             st.session_state.pop(key, None)
         st.rerun()
 
@@ -2801,6 +2968,115 @@ with st.expander("Automatic SportsGameOdds prop-line fetch", expanded=False):
             st.dataframe(debug_fetch, hide_index=True, width="stretch")
 
 
+with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=False):
+    st.caption("Uses The Odds API event-odds endpoint. The app fetches WNBA player prop markets one event at a time and locally matches Hard Rock Bet lines to your projection board.")
+    st.info("For Hard Rock in Florida, use bookmaker ID hardrockbet_fl first. The fallback hardrockbet ID is included too.")
+    the_odds_sport_key = st.text_input("The Odds API sport key", value=DEFAULT_THE_ODDS_SPORT_KEY, help="Usually basketball_wnba. If your account uses a different WNBA sport key, enter it here.")
+    the_odds_bookmakers = st.text_input("The Odds API bookmaker IDs", value="hardrockbet_fl,hardrockbet", help="Comma-separated bookmaker keys. Hard Rock FL is hardrockbet_fl.")
+    the_odds_markets = st.multiselect("Markets to fetch from The Odds API", list(TARGETS), default=list(TARGETS))
+    the_odds_games = st.multiselect("Games to query from The Odds API", board["Game"].drop_duplicates().tolist(), default=board["Game"].drop_duplicates().tolist())
+    if st.button("Find The Odds API WNBA event IDs", width="stretch"):
+        if not the_odds_api_key:
+            st.error("Enter your temporary The Odds API key in the sidebar.")
+        else:
+            try:
+                odds_events, meta = fetch_the_odds_events(the_odds_api_key, the_odds_sport_key, slate_date)
+                st.session_state["wnba_the_odds_events"] = odds_events
+                st.session_state["wnba_odds_meta"] = meta
+                if odds_events.empty:
+                    st.warning("No The Odds API WNBA event IDs matched this slate date. Check the event debug table below or confirm the sport key.")
+                else:
+                    st.success(f"Found {len(odds_events):,} The Odds API event IDs.")
+            except Exception as exc:
+                st.error(f"The Odds API event lookup failed: {type(exc).__name__}: {exc}")
+    odds_events = st.session_state.get("wnba_the_odds_events", pd.DataFrame())
+    if isinstance(odds_events, pd.DataFrame) and not odds_events.empty:
+        display_cols = [c for c in ["Game", "TheOddsEventID", "GameTimeUTC", "Source"] if c in odds_events.columns]
+        st.dataframe(odds_events[display_cols], hide_index=True, width="stretch")
+    odds_event_debug = st.session_state.get("wnba_the_odds_event_debug", pd.DataFrame())
+    if isinstance(odds_event_debug, pd.DataFrame) and not odds_event_debug.empty:
+        with st.expander("The Odds API event lookup debug", expanded=False):
+            st.dataframe(odds_event_debug, hide_index=True, width="stretch")
+    manual_the_odds_ids = st.text_area(
+        "Manual The Odds API event IDs (optional)",
+        value="",
+        height=80,
+        help="One per line, for example: MIN @ LAS = abc123",
+    )
+
+    def _manual_the_odds_id_lookup(text: str) -> dict[str, str]:
+        lookup: dict[str, str] = {}
+        for line in str(text or "").splitlines():
+            if "=" not in line:
+                continue
+            game, event_id = line.split("=", 1)
+            game = game.strip()
+            event_id = event_id.strip()
+            if game and event_id:
+                lookup[game] = event_id
+        return lookup
+
+    if st.button("Fetch Hard Rock WNBA prop lines from The Odds API", width="stretch"):
+        if not the_odds_api_key:
+            st.error("Enter your temporary The Odds API key in the sidebar.")
+        else:
+            try:
+                manual_lookup = _manual_the_odds_id_lookup(manual_the_odds_ids)
+                if (not isinstance(odds_events, pd.DataFrame) or odds_events.empty) and not manual_lookup:
+                    odds_events, meta = fetch_the_odds_events(the_odds_api_key, the_odds_sport_key, slate_date)
+                    st.session_state["wnba_the_odds_events"] = odds_events
+                    st.session_state["wnba_odds_meta"] = meta
+                elif (not isinstance(odds_events, pd.DataFrame) or odds_events.empty) and manual_lookup:
+                    meta = {"provider": "The Odds API", "endpoint": "manual event IDs"}
+                    st.session_state["wnba_odds_meta"] = meta
+                event_lookup = odds_events.set_index("Game")["TheOddsEventID"].astype(str).to_dict() if isinstance(odds_events, pd.DataFrame) and not odds_events.empty else {}
+                event_lookup.update(manual_lookup)
+                wanted_markets = tuple(TARGETS[target]["market"] for target in the_odds_markets)
+                bookmaker_ids = tuple(v.strip().lower().replace(" ", "") for v in str(the_odds_bookmakers or "").split(",") if v.strip())
+                frames: list[pd.DataFrame] = []
+                missing_games: list[str] = []
+                debug_rows: list[dict[str, Any]] = []
+                last_meta: dict[str, str] = {"provider": "The Odds API"}
+                for game in the_odds_games:
+                    event_id = event_lookup.get(game)
+                    if not event_id:
+                        missing_games.append(game)
+                        continue
+                    frame, last_meta = fetch_the_odds_event_props(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, wanted_markets)
+                    debug_rows.append({"Game": game, "TheOddsEventID": str(event_id), **last_meta})
+                    if frame is not None and not frame.empty:
+                        board_event_ids = board.loc[board["Game"].eq(game), "EventID"].dropna().astype(str).unique()
+                        if len(board_event_ids):
+                            frame["EventID"] = board_event_ids[0]
+                    frames.append(frame if frame is not None else pd.DataFrame())
+                if debug_rows:
+                    st.session_state["wnba_the_odds_fetch_debug"] = pd.DataFrame(debug_rows)
+                combined = combine_odds_frames(frames)
+                existing_odds = st.session_state.get("wnba_odds", pd.DataFrame())
+                if isinstance(existing_odds, pd.DataFrame) and not existing_odds.empty and "Source" in existing_odds.columns:
+                    existing_odds = existing_odds[~existing_odds["Source"].astype(str).str.lower().eq("the odds api")].copy()
+                else:
+                    existing_odds = pd.DataFrame()
+                st.session_state["wnba_odds"] = combine_odds_frames([existing_odds, combined])
+                st.session_state["wnba_odds_meta"] = last_meta
+                if missing_games:
+                    st.warning("Missing The Odds API event IDs for: " + ", ".join(missing_games))
+                if combined.empty:
+                    st.warning("No matching Hard Rock player props were parsed from The Odds API. Try hardrockbet_fl,hardrockbet, confirm WNBA props are available, and check the debug table below.")
+                else:
+                    st.success(f"Fetched {len(combined):,} quote rows from The Odds API.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"The Odds API prop fetch failed: {type(exc).__name__}: {exc}")
+    the_odds_meta = st.session_state.get("wnba_odds_meta", {})
+    if isinstance(the_odds_meta, dict) and the_odds_meta.get("provider") == "The Odds API":
+        st.caption("The Odds API meta: " + " · ".join(f"{k}: {v}" for k, v in the_odds_meta.items() if v))
+    the_odds_debug_fetch = st.session_state.get("wnba_the_odds_fetch_debug", pd.DataFrame())
+    if isinstance(the_odds_debug_fetch, pd.DataFrame) and not the_odds_debug_fetch.empty:
+        with st.expander("The Odds API fetch debug", expanded=False):
+            st.dataframe(the_odds_debug_fetch, hide_index=True, width="stretch")
+
+
 odds = st.session_state.get("wnba_odds", pd.DataFrame())
 board = apply_market_quotes(board, odds, odds_source_mode)
 st.session_state["wnba_board"] = board
@@ -2944,18 +3220,13 @@ with minutes_tab:
 
 with backtest_tab:
     st.markdown("### Save the current slate before tipoff")
-    snapshot_type_label = st.selectbox(
-        "Snapshot type",
-        ["pregame_live", "retro_clean", "postgame_dirty"],
-        index=0,
-        format_func=lambda value: {
-            "pregame_live": "Pregame live — normal saved-before-tipoff slate",
-            "retro_clean": "Retro-clean backfill — recreated with only pregame data",
-            "postgame_dirty": "Postgame/dirty — results tracking only, exclude from calibration",
-        }.get(value, value),
-        help="Use retro-clean when you are backfilling a past slate and rebuilt it with data that would have been available before tipoff. Retro-clean rows are allowed into calibration even though they were created after the game started.",
+    retro_clean_snapshot = st.checkbox(
+        "Mark this snapshot as retro-clean backfill",
+        value=False,
+        help="Use this when you are recreating an old slate with only pregame-safe inputs. Retro-clean rows can be included in calibration even though GeneratedAtUTC is after tipoff.",
     )
-    snapshot = build_snapshot(board, slate_date, snapshot_type_label)
+    snapshot_type = "retro_clean" if retro_clean_snapshot else "pregame_live"
+    snapshot = build_snapshot(board, slate_date, snapshot_type=snapshot_type)
     st.download_button(
         "Download pregame snapshot CSV", snapshot.to_csv(index=False).encode("utf-8"),
         file_name=f"wnba_props_snapshot_{slate_date}.csv", mime="text/csv", width="stretch",
@@ -2969,18 +3240,22 @@ with backtest_tab:
             st.session_state["wnba_history_errors"] = history_errors
             st.session_state["wnba_history_signature"] = signature
     history = normalize_history(st.session_state.get("wnba_history", pd.DataFrame()))
-    if not history.empty:
-        with st.expander("Retro-clean backfill controls", expanded=False):
-            st.caption("Use this only for past slates you rebuilt with the correct pregame setup, such as Slate Date = July 11 and Stats/Data Through = July 10. These rows remain marked after-start, but are included in clean calibration because SnapshotType is retro_clean.")
-            retro_candidates = history[history.get("SnapshotAfterStart", False).fillna(False) & ~history.get("RetroClean", False).fillna(False)]
-            st.write(f"Eligible after-start rows not yet retro-clean: {len(retro_candidates):,}")
-            if st.button("Mark after-start rows as retro-clean", width="stretch"):
-                mask = history.get("SnapshotAfterStart", False).fillna(False) & ~history.get("RetroClean", False).fillna(False)
+    include_retro_clean_rows = st.checkbox(
+        "Include retro-clean backfill rows in calibration analysis",
+        value=True,
+        help="Keeps true pregame rows plus rows marked SnapshotType=retro_clean. This prevents clean historical backfills from being excluded just because they were created after tipoff.",
+    )
+    retro_actions = st.columns(2)
+    with retro_actions[0]:
+        if st.button("Mark uploaded after-start rows as retro-clean", width="stretch", help="Use only for backfilled slates rebuilt with pregame-safe inputs. This marks current after-start rows as SnapshotType=retro_clean."):
+            if not history.empty:
+                mask = history["SnapshotAfterStart"].fillna(False)
                 history.loc[mask, "SnapshotType"] = "retro_clean"
-                history.loc[mask, "RetroClean"] = True
                 history = normalize_history(history)
                 st.session_state["wnba_history"] = history
                 st.success(f"Marked {int(mask.sum()):,} rows as retro-clean. Download the updated master history.")
+    with retro_actions[1]:
+        st.caption("Retro-clean rows can get official results and count in calibration; postgame/dirty rows should stay excluded.")
     action1, action2 = st.columns(2)
     with action1:
         if st.button("Add current snapshot to session master", width="stretch"):
@@ -3001,15 +3276,16 @@ with backtest_tab:
     if summary:
         st.caption(f"Results matched: {summary.get('matched', 0)} · unmatched: {summary.get('unmatched', 0)}")
 
-    include_retro_clean = st.checkbox("Include retro-clean backfills in calibration", value=True, help="Keeps normal after-start snapshots excluded, but includes rows marked SnapshotType=retro_clean or RetroClean=True.")
-    analysis = latest_pregame_history(history, include_retro_clean=include_retro_clean)
+    analysis = latest_pregame_history(history, include_retro_clean=include_retro_clean_rows)
     completed = analysis[analysis[[config["actual"] for config in TARGETS.values()]].notna().any(axis=1)].copy() if not analysis.empty else pd.DataFrame()
     metrics = st.columns(5)
+    after_start_n = int(history.get("SnapshotAfterStart", pd.Series(dtype=bool)).fillna(False).sum())
+    retro_clean_n = int(history.get("SnapshotRetroClean", pd.Series(dtype=bool)).fillna(False).sum())
     metrics[0].metric("Master rows", f"{len(history):,}")
     metrics[1].metric("Analysis rows", f"{len(analysis):,}")
     metrics[2].metric("Completed outcomes", f"{len(completed):,}")
-    metrics[3].metric("After-start rows", f"{int(history.get('SnapshotAfterStart', pd.Series(dtype=bool)).fillna(False).sum()):,}")
-    metrics[4].metric("Retro-clean rows", f"{int(history.get('RetroClean', pd.Series(dtype=bool)).fillna(False).sum()):,}")
+    metrics[3].metric("After-start rows", f"{after_start_n:,}")
+    metrics[4].metric("Retro-clean rows", f"{retro_clean_n:,}")
 
     if not completed.empty:
         st.markdown("### Projection accuracy")
@@ -3039,92 +3315,28 @@ with backtest_tab:
 
         st.markdown("### Fit target-specific projection calibration")
         min_rows = st.number_input("Minimum completed player-games", min_value=30, max_value=1000, value=75, step=25)
-
-        # First fit all targets so the dashboard can always show/download calibration candidates.
-        candidate_bundle, fit_table = make_calibration_bundle(completed, [], int(min_rows))
-        fit_table = fit_table.copy()
-        fit_table["holdout_improved"] = (
-            fit_table.get("ok", False).astype(bool)
-            & pd.to_numeric(fit_table.get("holdout_calibrated_mae"), errors="coerce").lt(
-                pd.to_numeric(fit_table.get("holdout_raw_mae"), errors="coerce")
-            )
-        )
-        recommended_targets = fit_table.loc[fit_table["holdout_improved"], "Target"].dropna().astype(str).tolist()
-
-        selected_fit_targets = st.multiselect(
-            "Targets to include if applied",
-            list(TARGETS),
-            default=recommended_targets,
-            help="Defaults to targets where chronological holdout MAE improved. You can override this before downloading/applying.",
-        )
+        selected_fit_targets = st.multiselect("Targets to include if applied", list(TARGETS), default=[])
         bundle, fit_table = make_calibration_bundle(completed, selected_fit_targets, int(min_rows))
-        fit_table = fit_table.copy()
-        fit_table["holdout_improved"] = (
-            fit_table.get("ok", False).astype(bool)
-            & pd.to_numeric(fit_table.get("holdout_calibrated_mae"), errors="coerce").lt(
-                pd.to_numeric(fit_table.get("holdout_raw_mae"), errors="coerce")
-            )
-        )
         st.dataframe(fit_table.style.format({
             "slope": "{:.4f}", "intercept": "{:+.4f}", "raw_mae": "{:.3f}", "calibrated_mae": "{:.3f}",
             "holdout_raw_mae": "{:.3f}", "holdout_calibrated_mae": "{:.3f}",
         }), hide_index=True, width="stretch")
         st.caption("Apply a target only when the chronological holdout MAE improves—not merely the full-sample MAE.")
-
-        # Always show download controls so the user can save the calibration/report even when no target is selected.
-        recommended_bundle, _ = make_calibration_bundle(completed, recommended_targets, int(min_rows))
-        report_payload = {
-            "version": MODEL_VERSION,
-            "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
-            "min_rows": int(min_rows),
-            "recommended_targets": recommended_targets,
-            "selected_targets": selected_fit_targets,
-            "selected_calibration": bundle,
-            "recommended_calibration": recommended_bundle,
-            "fit_table": fit_table.to_dict(orient="records"),
-        }
-
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st.download_button(
-                "Download selected calibration JSON",
-                json.dumps(bundle, indent=2).encode("utf-8"),
-                file_name="wnba_projection_calibration_selected.json",
-                mime="application/json",
-                width="stretch",
-                disabled=not bool(bundle.get("targets")),
-                help="Select one or more targets above to enable this file.",
-            )
-        with d2:
-            st.download_button(
-                "Download recommended calibration JSON",
-                json.dumps(recommended_bundle, indent=2).encode("utf-8"),
-                file_name="wnba_projection_calibration_recommended.json",
-                mime="application/json",
-                width="stretch",
-                disabled=not bool(recommended_bundle.get("targets")),
-                help="Includes only targets where chronological holdout MAE improved.",
-            )
-        with d3:
-            st.download_button(
-                "Download calibration report JSON",
-                json.dumps(report_payload, indent=2, default=str).encode("utf-8"),
-                file_name="wnba_projection_calibration_report.json",
-                mime="application/json",
-                width="stretch",
-                help="Always available. Includes the full fit table, selected targets, and recommended targets.",
-            )
-
         if bundle.get("targets"):
-            if st.button("Apply selected calibration to current board", width="stretch"):
-                st.session_state["wnba_projection_calibration"] = bundle
-                base = st.session_state.get("wnba_base_board", board)
-                calibrated = apply_projection_calibration(base, bundle)
-                calibrated = apply_market_quotes(calibrated, odds, odds_source_mode)
-                st.session_state["wnba_board"] = calibrated
-                st.rerun()
-        else:
-            st.info("No selected targets are currently included in the calibration JSON. Select targets above or use the calibration report download for review.")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "Download selected calibration JSON", json.dumps(bundle, indent=2).encode("utf-8"),
+                    file_name="wnba_projection_calibration.json", mime="application/json", width="stretch",
+                )
+            with c2:
+                if st.button("Apply selected calibration to current board", width="stretch"):
+                    st.session_state["wnba_projection_calibration"] = bundle
+                    base = st.session_state.get("wnba_base_board", board)
+                    calibrated = apply_projection_calibration(base, bundle)
+                    calibrated = apply_market_quotes(calibrated, odds, odds_source_mode)
+                    st.session_state["wnba_board"] = calibrated
+                    st.rerun()
 
         st.markdown("### Segment checks")
         segment = st.selectbox("Break results down by", ["Confidence", "Role", "HomeAway", "Injury_Status"])
