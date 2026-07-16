@@ -153,8 +153,10 @@ BOOKMAKER_LABELS = {
 }
 
 LINE_SOURCE_OPTIONS = [
-    "Consensus",
     "PrizePicks",
+    "Consensus sportsbooks",
+    "Best sportsbook over line",
+    "Best sportsbook under line",
     "Hard Rock Bet",
     "FanDuel",
     "DraftKings",
@@ -162,6 +164,7 @@ LINE_SOURCE_OPTIONS = [
     "Caesars",
     "ESPN BET",
     "BetRivers",
+    "Pinnacle",
     "Underdog Fantasy",
 ]
 
@@ -174,8 +177,20 @@ LINE_SOURCE_DEFAULT_BOOKMAKER_IDS = {
     "Caesars": ("caesars",),
     "ESPN BET": ("espnbet",),
     "BetRivers": ("betrivers",),
+    "Pinnacle": ("pinnacle",),
     "Underdog Fantasy": ("underdog",),
 }
+
+SPORTSBOOK_BOOKMAKER_KEYS = {
+    "hardrockbet", "hardrockbet_fl", "hardrockbet_az", "hardrockbet_oh", "hard_rock_bet",
+    "fanduel", "fan_duel", "draftkings", "draft_kings", "betmgm", "bet_mgm",
+    "caesars", "espnbet", "espn_bet", "betrivers", "bet_rivers", "pinnacle",
+}
+
+THE_ODDS_DEFAULT_BOOKMAKER_IDS = (
+    "hardrockbet_fl", "hardrockbet", "fanduel", "draftkings", "betmgm",
+    "caesars", "espnbet", "betrivers", "pinnacle",
+)
 
 DEFAULT_STAT_SDS = {"Points": 5.5, "Rebounds": 2.7, "Assists": 2.2, "PRA": 7.5}
 
@@ -1059,17 +1074,98 @@ def combine_odds_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return combined.drop_duplicates(required, keep="last")
 
 
+def _is_sportsbook_quote(row: pd.Series) -> bool:
+    key = str(row.get("BookmakerKey", "") or "").lower().replace(" ", "_").replace("-", "_")
+    label = _compact_bookmaker(row.get("Bookmaker", ""))
+    if key in SPORTSBOOK_BOOKMAKER_KEYS:
+        return True
+    return any(_compact_bookmaker(book_key) in label or label.startswith(_compact_bookmaker(book_key)) for book_key in SPORTSBOOK_BOOKMAKER_KEYS)
+
+
+def _best_price(values: pd.Series) -> float:
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return np.nan
+    return float(numeric.max())
+
+
 def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]:
     if group is None or group.empty:
         return {}
     data = group.copy()
-    source_mode = str(source_mode or "Consensus")
-    if source_mode != "Consensus":
+    source_mode = str(source_mode or "Consensus sportsbooks")
+    normalized_mode = source_mode.strip().lower()
+
+    # Keep the old label working for saved sessions, but make sportsbook consensus the default behavior.
+    consensus_modes = {"consensus", "consensus sportsbooks", "consensus sportsbook", "sportsbook consensus"}
+    best_over_modes = {"best sportsbook over line", "best over line", "best over"}
+    best_under_modes = {"best sportsbook under line", "best under line", "best under"}
+
+    if normalized_mode in consensus_modes or normalized_mode in best_over_modes or normalized_mode in best_under_modes:
+        sports_mask = data.apply(_is_sportsbook_quote, axis=1)
+        sportsbook_data = data[sports_mask].copy()
+        if not sportsbook_data.empty:
+            data = sportsbook_data
+
+    if normalized_mode in best_over_modes:
+        numeric_line = pd.to_numeric(data.get("Line", pd.Series(dtype=float)), errors="coerce")
+        valid = data[numeric_line.notna()].copy()
+        if valid.empty:
+            return {}
+        numeric_line = pd.to_numeric(valid["Line"], errors="coerce")
+        # For an over, the best book is the lowest line. Tie-break by best over price.
+        target_line = float(numeric_line.min())
+        near = valid[np.isclose(numeric_line, target_line, atol=0.01)].copy()
+        over_prices = pd.to_numeric(near.loc[near["Side"].astype(str).str.lower().eq("over"), "Odds"], errors="coerce") if "Odds" in near.columns else pd.Series(dtype=float)
+        best_over = _best_price(over_prices)
+        if np.isfinite(best_over):
+            preferred_books = near[near["Side"].astype(str).str.lower().eq("over") & pd.to_numeric(near["Odds"], errors="coerce").eq(best_over)]
+            if not preferred_books.empty:
+                preferred_key = str(preferred_books.iloc[0].get("BookmakerKey", ""))
+                near = near[near.get("BookmakerKey", pd.Series(index=near.index, dtype=object)).astype(str).eq(preferred_key)]
+        under_prices = pd.to_numeric(near.loc[near["Side"].astype(str).str.lower().eq("under"), "Odds"], errors="coerce") if "Odds" in near.columns else pd.Series(dtype=float)
+        books = sorted(near.get("Bookmaker", pd.Series(dtype=str)).dropna().astype(str).unique())
+        return {
+            "Line": target_line,
+            "OverOdds": best_over,
+            "UnderOdds": _best_price(under_prices),
+            "MarketOverProb": no_vig_over_probability(best_over, _best_price(under_prices)),
+            "Source": f"Best over · {books[0] if books else 'sportsbook'}",
+        }
+
+    if normalized_mode in best_under_modes:
+        numeric_line = pd.to_numeric(data.get("Line", pd.Series(dtype=float)), errors="coerce")
+        valid = data[numeric_line.notna()].copy()
+        if valid.empty:
+            return {}
+        numeric_line = pd.to_numeric(valid["Line"], errors="coerce")
+        # For an under, the best book is the highest line. Tie-break by best under price.
+        target_line = float(numeric_line.max())
+        near = valid[np.isclose(numeric_line, target_line, atol=0.01)].copy()
+        under_prices = pd.to_numeric(near.loc[near["Side"].astype(str).str.lower().eq("under"), "Odds"], errors="coerce") if "Odds" in near.columns else pd.Series(dtype=float)
+        best_under = _best_price(under_prices)
+        if np.isfinite(best_under):
+            preferred_books = near[near["Side"].astype(str).str.lower().eq("under") & pd.to_numeric(near["Odds"], errors="coerce").eq(best_under)]
+            if not preferred_books.empty:
+                preferred_key = str(preferred_books.iloc[0].get("BookmakerKey", ""))
+                near = near[near.get("BookmakerKey", pd.Series(index=near.index, dtype=object)).astype(str).eq(preferred_key)]
+        over_prices = pd.to_numeric(near.loc[near["Side"].astype(str).str.lower().eq("over"), "Odds"], errors="coerce") if "Odds" in near.columns else pd.Series(dtype=float)
+        books = sorted(near.get("Bookmaker", pd.Series(dtype=str)).dropna().astype(str).unique())
+        return {
+            "Line": target_line,
+            "OverOdds": _best_price(over_prices),
+            "UnderOdds": best_under,
+            "MarketOverProb": no_vig_over_probability(_best_price(over_prices), best_under),
+            "Source": f"Best under · {books[0] if books else 'sportsbook'}",
+        }
+
+    if normalized_mode not in consensus_modes:
         label_match = data["Bookmaker"].map(lambda value: bookmaker_matches_source(value, source_mode)) if "Bookmaker" in data.columns else pd.Series(False, index=data.index)
         id_match = data["BookmakerKey"].map(lambda value: bookmaker_matches_source(value, source_mode)) if "BookmakerKey" in data.columns else pd.Series(False, index=data.index)
         data = data[label_match | id_match]
         if data.empty:
             return {}
+
     lines = pd.to_numeric(data.get("Line", pd.Series(dtype=float)), errors="coerce").dropna()
     if lines.empty:
         return {}
@@ -1082,12 +1178,16 @@ def choose_market_quote(group: pd.DataFrame, source_mode: str) -> dict[str, Any]
     over_odds = float(over_prices.median()) if not over_prices.empty else np.nan
     under_odds = float(under_prices.median()) if not under_prices.empty else np.nan
     books = sorted(near.get("Bookmaker", pd.Series(dtype=str)).dropna().astype(str).unique())
+    if normalized_mode in consensus_modes:
+        source_label = f"Consensus sportsbooks ({len(books)} books)"
+    else:
+        source_label = source_mode
     return {
         "Line": target_line,
         "OverOdds": over_odds,
         "UnderOdds": under_odds,
         "MarketOverProb": no_vig_over_probability(over_odds, under_odds),
-        "Source": source_mode if source_mode != "Consensus" else f"Consensus ({len(books)} books)",
+        "Source": source_label,
     }
 
 
@@ -1705,6 +1805,8 @@ with st.sidebar:
     st.subheader("Automatic prop lines")
     the_odds_api_key = st.text_input("The Odds API key (session only)", type="password")
     default_line_source = st.session_state.get("wnba_line_source_mode", "PrizePicks")
+    if str(default_line_source).strip().lower() == "consensus":
+        default_line_source = "Consensus sportsbooks"
     if default_line_source not in LINE_SOURCE_OPTIONS:
         default_line_source = "PrizePicks" if "PrizePicks" in LINE_SOURCE_OPTIONS else LINE_SOURCE_OPTIONS[0]
     odds_source_mode = st.selectbox(
@@ -1712,7 +1814,7 @@ with st.sidebar:
         LINE_SOURCE_OPTIONS,
         index=LINE_SOURCE_OPTIONS.index(default_line_source),
         key="wnba_line_source_mode",
-        help="Choose Consensus or a specific provider. Select Hard Rock Bet after fetching Hard Rock lines from The Odds API.",
+        help="Choose PrizePicks, a specific sportsbook, sportsbook consensus, or the best available over/under line after fetching The Odds API lines.",
     )
     if st.button("Clear cached data", width="stretch"):
         st.cache_data.clear()
@@ -1880,14 +1982,18 @@ with st.expander("PrizePicks line import — screenshot/CSV workflow", expanded=
         with st.expander("PrizePicks match debug", expanded=False):
             st.dataframe(pp_debug_display, hide_index=True, width="stretch")
 
-with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=False):
-    st.caption("Uses The Odds API event-odds endpoint. The app fetches WNBA player prop markets one event at a time and locally matches Hard Rock Bet lines to your projection board.")
-    st.info("For Hard Rock in Florida, use bookmaker ID hardrockbet_fl first. The fallback hardrockbet ID is included too.")
+with st.expander("Automatic The Odds API multi-book WNBA prop-line fetch", expanded=False):
+    st.caption("Uses The Odds API event-odds endpoint. The app fetches WNBA player prop markets one event at a time, stores every returned sportsbook line, then your Line source selector decides which line to apply.")
+    st.info("Use this like the MLB pitcher dashboard: fetch several sportsbooks once, then switch between Hard Rock, FanDuel, DraftKings, Consensus sportsbooks, Best sportsbook over line, or Best sportsbook under line.")
     the_odds_sport_key = st.text_input("The Odds API sport key", value=DEFAULT_THE_ODDS_SPORT_KEY, help="Usually basketball_wnba. If your account uses a different WNBA sport key, enter it here.")
-    the_odds_bookmakers = st.text_input("The Odds API bookmaker IDs", value="hardrockbet_fl,hardrockbet", help="Comma-separated bookmaker keys. Hard Rock FL is usually hardrockbet_fl. If no lines return, use discovery mode below to see what books The Odds API returned.")
-    the_odds_regions = st.text_input("The Odds API regions for discovery", value="us,us2", help="Only used in discovery mode; bookmaker-specific fetches ignore regions per The Odds API rules.")
+    selected_default_bookmakers = LINE_SOURCE_DEFAULT_BOOKMAKER_IDS.get(odds_source_mode, THE_ODDS_DEFAULT_BOOKMAKER_IDS)
+    if odds_source_mode in {"Consensus sportsbooks", "Best sportsbook over line", "Best sportsbook under line"}:
+        selected_default_bookmakers = THE_ODDS_DEFAULT_BOOKMAKER_IDS
+    default_bookmaker_text = ",".join(selected_default_bookmakers)
+    the_odds_bookmakers = st.text_input("The Odds API bookmaker IDs to fetch", value=default_bookmaker_text, help="Comma-separated sportsbook keys. For consensus/best-line mode, leave the default multi-book list. For one book, select that source above or type its bookmaker key here.")
+    the_odds_regions = st.text_input("The Odds API regions for all-book discovery", value="us,us2", help="Only used when you request all returned books/discovery; bookmaker-specific fetches ignore regions per The Odds API rules.")
     the_odds_markets = st.multiselect("Markets to fetch from The Odds API", list(TARGETS), default=list(TARGETS))
-    discover_the_odds_books = st.checkbox("Debug/discovery: also check all returned bookmakers if Hard Rock returns no rows", value=True)
+    discover_the_odds_books = st.checkbox("Debug/discovery: also check all returned bookmakers if selected books return no rows", value=True)
     the_odds_games = st.multiselect("Games to query from The Odds API", board["Game"].drop_duplicates().tolist(), default=board["Game"].drop_duplicates().tolist())
     if st.button("Find The Odds API WNBA event IDs", width="stretch"):
         if not the_odds_api_key:
@@ -1957,11 +2063,11 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
                     if not all_markets.empty:
                         all_markets.insert(0, "Game", game)
                     market_frames.append(all_markets)
-                    hardrock_markets, _ = fetch_the_odds_event_markets(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, regions=the_odds_regions)
-                    if not hardrock_markets.empty:
-                        hardrock_markets.insert(0, "Game", game)
-                        hardrock_markets["Scope"] = "Selected bookmaker IDs"
-                        market_frames.append(hardrock_markets)
+                    selected_markets, _ = fetch_the_odds_event_markets(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, regions=the_odds_regions)
+                    if not selected_markets.empty:
+                        selected_markets.insert(0, "Game", game)
+                        selected_markets["Scope"] = "Selected bookmaker IDs"
+                        market_frames.append(selected_markets)
                     featured, _ = fetch_the_odds_featured_odds_check(the_odds_api_key, the_odds_sport_key, str(event_id), regions=the_odds_regions)
                     if not featured.empty:
                         featured.insert(0, "Game", game)
@@ -1983,7 +2089,7 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
             except Exception as exc:
                 st.error(f"The Odds API market diagnostic failed: {type(exc).__name__}: {exc}")
 
-    if st.button("Fetch Hard Rock WNBA prop lines from The Odds API", width="stretch"):
+    if st.button("Fetch selected WNBA prop lines from The Odds API", width="stretch"):
         if not the_odds_api_key:
             st.error("Enter your temporary The Odds API key in the sidebar.")
         else:
@@ -2011,7 +2117,7 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
                         continue
                     frame, last_meta = fetch_the_odds_event_props(the_odds_api_key, the_odds_sport_key, str(event_id), bookmaker_ids, wanted_markets, regions=the_odds_regions, discover_all_books=False)
                     debug_row = {"Game": game, "TheOddsEventID": str(event_id), **last_meta}
-                    # If Hard Rock returns nothing, optionally do a no-bookmaker-filter request
+                    # If selected books return nothing, optionally do a no-bookmaker-filter request
                     # only for debugging so you can see whether The Odds API has any props at all.
                     if (frame is None or frame.empty) and discover_the_odds_books:
                         discovery_frame, discovery_meta = fetch_the_odds_event_props(the_odds_api_key, the_odds_sport_key, str(event_id), tuple(), wanted_markets, regions=the_odds_regions, discover_all_books=True)
@@ -2039,10 +2145,12 @@ with st.expander("Automatic The Odds API Hard Rock prop-line fetch", expanded=Fa
                 if missing_games:
                     st.warning("Missing The Odds API event IDs for: " + ", ".join(missing_games))
                 if combined.empty:
-                    st.warning("No Hard Rock player props were parsed from The Odds API. Open the debug table: if returned_bookmakers is blank, Hard Rock did not return props for that game/market; if discovery_returned_bookmakers has other books, The Odds API has props but not Hard Rock for your selected IDs.")
+                    st.warning("No selected-book player props were parsed from The Odds API. Open the debug table: if returned_bookmakers is blank, those books did not return props for that game/market; if discovery_returned_bookmakers has other books, The Odds API has props but not for your selected IDs.")
                 else:
-                    st.session_state["wnba_line_source_mode"] = "Hard Rock Bet"
-                    st.success(f"Fetched {len(combined):,} Hard Rock quote rows from The Odds API. Line source switched to Hard Rock Bet.")
+                    st.session_state["wnba_line_source_mode"] = odds_source_mode if odds_source_mode in LINE_SOURCE_OPTIONS else "Consensus sportsbooks"
+                    returned_books = sorted(combined.get("Bookmaker", pd.Series(dtype=str)).dropna().astype(str).unique())
+                    book_text = ", ".join(returned_books[:8]) + ("..." if len(returned_books) > 8 else "")
+                    st.success(f"Fetched {len(combined):,} quote rows from The Odds API across {combined.get('BookmakerKey', pd.Series(dtype=str)).nunique()} books. Books: {book_text}")
                 st.rerun()
             except Exception as exc:
                 st.error(f"The Odds API prop fetch failed: {type(exc).__name__}: {exc}")
