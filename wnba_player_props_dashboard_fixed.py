@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -42,6 +43,7 @@ ESPN_WNBA_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
 EASTERN_TZ = ZoneInfo("America/New_York")
 THE_ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 DEFAULT_THE_ODDS_SPORT_KEY = "basketball_wnba"
+WNBA_CACHE_DIR = Path(__file__).resolve().parent / "data_cache"
 
 TARGETS: dict[str, dict[str, str]] = {
     "Points": {
@@ -609,23 +611,101 @@ def load_espn_game_logs(season: str, season_type: str) -> tuple[pd.DataFrame, pd
     return player_logs, team_logs
 
 
+def _game_log_cache_paths(season: str, season_type: str) -> tuple[Path, Path, Path]:
+    key = re.sub(r"[^a-z0-9]+", "_", f"{season}_{season_type}".lower()).strip("_")
+    return (
+        WNBA_CACHE_DIR / f"{key}_players.csv",
+        WNBA_CACHE_DIR / f"{key}_teams.csv",
+        WNBA_CACHE_DIR / f"{key}_meta.json",
+    )
+
+
+def save_game_logs_snapshot(
+    season: str,
+    season_type: str,
+    player_logs: pd.DataFrame,
+    team_logs: pd.DataFrame,
+    source: str,
+) -> None:
+    """Persist the last known-good logs so a provider outage cannot take down the board."""
+    if player_logs is None or player_logs.empty or team_logs is None or team_logs.empty:
+        return
+    players_path, teams_path, meta_path = _game_log_cache_paths(season, season_type)
+    try:
+        WNBA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        players_tmp = players_path.with_suffix(".csv.tmp")
+        teams_tmp = teams_path.with_suffix(".csv.tmp")
+        meta_tmp = meta_path.with_suffix(".json.tmp")
+        player_logs.to_csv(players_tmp, index=False)
+        team_logs.to_csv(teams_tmp, index=False)
+        meta_tmp.write_text(json.dumps({
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "season": season,
+            "season_type": season_type,
+            "source": source,
+            "player_rows": int(len(player_logs)),
+            "team_rows": int(len(team_logs)),
+        }, indent=2), encoding="utf-8")
+        players_tmp.replace(players_path)
+        teams_tmp.replace(teams_path)
+        meta_tmp.replace(meta_path)
+    except Exception:
+        # Caching is a resilience feature; a filesystem problem must never break live data loading.
+        return
+
+
+def load_game_logs_snapshot(season: str, season_type: str) -> tuple[pd.DataFrame, pd.DataFrame, str] | None:
+    players_path, teams_path, meta_path = _game_log_cache_paths(season, season_type)
+    if not players_path.exists() or not teams_path.exists():
+        return None
+    try:
+        players = normalize_player_logs(pd.read_csv(players_path))
+        teams = normalize_team_logs(pd.read_csv(teams_path))
+        if players.empty or teams.empty:
+            return None
+        meta: dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+        saved_at = str(meta.get("saved_at_utc") or "unknown time")
+        original_source = str(meta.get("source") or "previous successful load")
+        source = f"Saved local snapshot ({saved_at}) · originally {original_source}"
+        return players, teams, source
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_official_game_logs(season: str, season_type: str) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     official_error = ""
     try:
-        players = fetch_wnba_stats("leaguegamelog", league_game_log_params(season, "P", season_type))
-        teams = fetch_wnba_stats("leaguegamelog", league_game_log_params(season, "T", season_type))
-        return normalize_player_logs(players), normalize_team_logs(teams), "Official WNBA Stats"
+        players = normalize_player_logs(fetch_wnba_stats("leaguegamelog", league_game_log_params(season, "P", season_type)))
+        teams = normalize_team_logs(fetch_wnba_stats("leaguegamelog", league_game_log_params(season, "T", season_type)))
+        save_game_logs_snapshot(season, season_type, players, teams, "Official WNBA Stats")
+        return players, teams, "Official WNBA Stats"
     except Exception as exc:
         official_error = f"{type(exc).__name__}: {exc}"
+
+    espn_error = ""
     try:
         players, teams = load_espn_game_logs(season, season_type)
+        players = normalize_player_logs(players)
+        teams = normalize_team_logs(teams)
+        save_game_logs_snapshot(season, season_type, players, teams, "ESPN automatic fallback")
         return players, teams, "ESPN automatic fallback"
-    except Exception as espn_exc:
-        raise RuntimeError(
-            f"Official WNBA Stats failed ({official_error}). ESPN fallback also failed "
-            f"({type(espn_exc).__name__}: {espn_exc})."
-        )
+    except Exception as exc:
+        espn_error = f"{type(exc).__name__}: {exc}"
+
+    cached = load_game_logs_snapshot(season, season_type)
+    if cached is not None:
+        return cached
+
+    raise RuntimeError(
+        f"Official WNBA Stats failed ({official_error}). ESPN fallback also failed ({espn_error}). "
+        "No saved local snapshot exists yet. Once any live load succeeds, future outages will automatically use it."
+    )
 
 
 def normalize_player_logs(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1782,7 +1862,7 @@ with st.sidebar:
     season = st.selectbox("Season", [str(year) for year in range(current_year, 2019, -1)], index=0)
     season_type = st.selectbox("Season type", ["Regular Season", "Playoffs"])
     slate_date = st.date_input("Slate date", value=date.today())
-    st.caption("The app tries official WNBA Stats first, then automatically falls back to ESPN box scores. CSV uploads remain available.")
+    st.caption("Data order: official WNBA Stats → ESPN → last saved local snapshot. CSV uploads remain available.")
 
     player_csv = st.file_uploader("Optional player game-log CSV", type=["csv"], key="wnba_player_logs")
     team_csv = st.file_uploader("Optional team game-log CSV", type=["csv"], key="wnba_team_logs")
@@ -1830,6 +1910,13 @@ with schedule_col:
     load_schedule = st.button("Load / refresh slate", width="stretch")
 
 if load_data or "wnba_player_logs_data" not in st.session_state:
+    if load_data:
+        # A manual refresh should really retry providers instead of reusing Streamlit's function cache.
+        for cached_func in (load_official_game_logs, fetch_wnba_stats, load_espn_game_logs):
+            try:
+                cached_func.clear()
+            except Exception:
+                pass
     try:
         if player_csv is not None and team_csv is not None:
             player_logs = read_uploaded_csv(player_csv, normalize_player_logs)
@@ -1839,6 +1926,7 @@ if load_data or "wnba_player_logs_data" not in st.session_state:
                 player_logs, team_logs, data_source = load_official_game_logs(season, season_type)
         if player_csv is not None and team_csv is not None:
             data_source = "Uploaded CSV files"
+            save_game_logs_snapshot(season, season_type, player_logs, team_logs, data_source)
         st.session_state["wnba_player_logs_data"] = player_logs
         st.session_state["wnba_team_logs_data"] = team_logs
         st.session_state["wnba_data_source"] = data_source
